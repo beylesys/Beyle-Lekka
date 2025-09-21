@@ -3,6 +3,27 @@ import React, { createContext, useContext, useState } from "react";
 
 const PromptContext = createContext();
 
+// ---- tiny helpers -----------------------------------------------------------
+const isPreviewish = (s) =>
+  ["preview", "success", "ok", "ready"].includes(String(s || "").toLowerCase());
+
+const extractJournal = (obj) => {
+  if (Array.isArray(obj?.journal)) return obj.journal;
+  if (Array.isArray(obj?.normalized)) return obj.normalized;
+  if (Array.isArray(obj?.ledgerView?.journal)) return obj.ledgerView.journal;
+  return [];
+};
+
+const normalizeDocFields = (docType, documentFields) => {
+  const dt = typeof docType === "string" ? docType : "none";
+  const df = documentFields && typeof documentFields === "object" ? documentFields : {};
+  if (dt === "none") return {};
+  // Accept both shapes:
+  // - { invoice: {...} } already keyed
+  // - { number: "...", items: [...] } flattened -> key it under docType
+  return df[dt] ? df : { [dt]: df };
+};
+
 export const PromptProvider = ({ children }) => {
   const [sessionId] = useState(() => `S-${Date.now()}`);
   const [prompt, setPrompt] = useState("");
@@ -22,25 +43,19 @@ export const PromptProvider = ({ children }) => {
    *  Legacy (old):
    *    { prompt, results: [{type, content}, ...], status?, message? }
    */
-  const updatePromptSession = (data) => {
+  const updatePromptSession = (dataIn) => {
+    // 0) unwrap if someone wrapped as { data: {...} }
+    const data =
+      dataIn && typeof dataIn === "object" && dataIn.data && !("status" in dataIn)
+        ? dataIn.data
+        : dataIn;
+
     console.log("📥 [updatePromptSession] Raw Data:", data);
 
     const rawStatus = typeof data?.status === "string" ? data.status.toLowerCase() : "";
-
-    // Prefer 'journal', fallback to 'normalized'
-    const normalizedJournal =
-      Array.isArray(data?.journal) ? data.journal :
-      Array.isArray(data?.normalized) ? data.normalized :
-      null;
-
-    // Normalize doc preview payload
-    const normalizedDocType =
-      typeof data?.docType === "string" ? data.docType : "none";
-
-    const normalizedDocumentFields =
-      data?.documentFields && typeof data.documentFields === "object"
-        ? data.documentFields
-        : {};
+    const journal = extractJournal(data);
+    const docType = typeof data?.docType === "string" ? data.docType : "none";
+    const documentFields = normalizeDocFields(docType, data?.documentFields);
 
     // ---------- FOLLOW-UP MODE ----------
     if (rawStatus === "followup_needed") {
@@ -48,9 +63,8 @@ export const PromptProvider = ({ children }) => {
         kind: "followup",
         clarification: data?.clarification || "Please provide the missing detail.",
         promptType: data?.promptType || null,
-        // NEW: carry docType so UI can frame the follow-up properly
-        docType: normalizedDocType,
-        raw: data
+        docType,
+        raw: data,
       };
       setThread((prev) => [...prev, entry]);
       setStatus("followup");
@@ -60,19 +74,18 @@ export const PromptProvider = ({ children }) => {
     }
 
     // ---------- PREVIEW / SUCCESS MODE ----------
-    // Treat 'success' like 'preview' (preview = save contract)
-    if ((rawStatus === "preview" || rawStatus === "success") && Array.isArray(normalizedJournal) && normalizedJournal.length >= 2) {
+    if (isPreviewish(rawStatus) && journal.length >= 1) {
       const entry = {
         kind: "preview",
-        journal: normalizedJournal,                 // rows the preview card renders
+        journal,
         ledgerView: data?.ledgerView || "",
         explanation: data?.explanation || "",
         newAccounts: Array.isArray(data?.newAccounts) ? data.newAccounts : [],
+        warnings: Array.isArray(data?.warnings) ? data.warnings : [],
         promptType: data?.promptType || null,
-        // NEW: doc preview payload from backend
-        docType: normalizedDocType,                 // "invoice" | "receipt" | "payment_voucher" | "none"
-        documentFields: normalizedDocumentFields,   // { invoice|receipt|payment_voucher: {...} } or {}
-        raw: data
+        docType,
+        documentFields,
+        raw: data,
       };
       setThread((prev) => [...prev, entry]);
       setStatus("preview");
@@ -92,7 +105,7 @@ export const PromptProvider = ({ children }) => {
         message: msg,
         errors: data?.errors || [],
         warnings: data?.warnings || [],
-        raw: data
+        raw: data,
       };
       setThread((prev) => [...prev, entry]);
       setStatus("error");
@@ -104,8 +117,15 @@ export const PromptProvider = ({ children }) => {
     // ---------- LEGACY SHAPE (prompt + results) ----------
     const hasLegacy = data?.prompt && Array.isArray(data?.results);
     if (hasLegacy) {
-      const validatedResults = data.results.filter((res) => res?.type && res?.content !== undefined);
-      const newEntry = { kind: "legacy", prompt: data.prompt, results: validatedResults, raw: data };
+      const validatedResults = data.results.filter(
+        (res) => res?.type && res?.content !== undefined
+      );
+      const newEntry = {
+        kind: "legacy",
+        prompt: data.prompt,
+        results: validatedResults,
+        raw: data,
+      };
 
       console.log("📌 Adding New Entry to Thread (legacy):", newEntry);
       setThread((prev) => [...prev, newEntry]);
@@ -121,19 +141,19 @@ export const PromptProvider = ({ children }) => {
     }
 
     // ---------- FALLBACK ----------
-    // If nothing matched but we have a journal-looking object, try to render preview anyway.
-    if ( Array.isArray(normalizedJournal) && normalizedJournal.length >= 2 ) {
+    // If we still received a journal-like array, try to render a preview anyway.
+    if (journal.length >= 1) {
       const entry = {
         kind: "preview",
-        journal: normalizedJournal,
+        journal,
         ledgerView: data?.ledgerView || "",
         explanation: data?.explanation || "",
         newAccounts: Array.isArray(data?.newAccounts) ? data.newAccounts : [],
+        warnings: Array.isArray(data?.warnings) ? data.warnings : [],
         promptType: data?.promptType || null,
-        // Try to surface doc payload if present even in odd shapes
-        docType: normalizedDocType,
-        documentFields: normalizedDocumentFields,
-        raw: data
+        docType,
+        documentFields,
+        raw: data,
       };
       setThread((prev) => [...prev, entry]);
       setStatus("preview");
@@ -142,8 +162,10 @@ export const PromptProvider = ({ children }) => {
       return;
     }
 
-    // Nothing matched → error
-    console.warn("⚠️ Unrecognized response shape, entering error state:", data);
+    // Nothing matched → push a raw entry so UI can optionally show it (debug),
+    // but mark state as error so callers know it didn't fit known shapes.
+    console.warn("⚠️ Unrecognized response shape, storing raw and entering error state:", data);
+    setThread((prev) => [...prev, { kind: "raw", raw: data }]);
     setStatus("error");
     setLastResponseType("error");
     setPrompt("");
@@ -169,7 +191,7 @@ export const PromptProvider = ({ children }) => {
         setThread,
         updatePromptSession,
         resetThread,
-        lastResponseType
+        lastResponseType,
       }}
     >
       {children}

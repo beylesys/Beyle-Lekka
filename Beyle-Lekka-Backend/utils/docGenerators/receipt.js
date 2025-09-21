@@ -1,16 +1,16 @@
-// utils/docGenerators/receipt.js
+﻿// utils/docGenerators/receipt.js
 import fs from "fs";
 import path from "path";
 import { v4 as uuidv4 } from "uuid";
 import { Document, Packer, Paragraph, TextRun, AlignmentType } from "docx";
 import dotenv from "dotenv";
-import { getNextNumber } from "../../services/series.js"; // ← numbering service
+import { getNextNumber } from "../../services/series.js"; // fallback only
 dotenv.config();
 
 const OUTPUT_DIR = path.resolve("./generated_docs");
 if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
-const CURRENCY = process.env.CURRENCY_SYMBOL || "₹";
+const CURRENCY = process.env.CURRENCY_SYMBOL || "â‚¹";
 
 function twoDp(n) {
   const x = Number(n);
@@ -21,6 +21,12 @@ function sanitizeForFilename(s) {
   return String(s).replace(/[^a-z0-9\-_.]/gi, "-");
 }
 
+/**
+ * Accepts a pre-reserved number (from preview snapshot) via:
+ *   structured.documentFields.receipt.number   (preferred)
+ *   structured.documentFields.receipt.receiptNo (legacy)
+ * Falls back to getNextNumber("receipt") ONLY if neither is provided.
+ */
 export async function generateReceiptDoc({ structured }) {
   const fIn = structured?.documentFields?.receipt;
   if (!fIn) throw new Error("Missing documentFields.receipt");
@@ -28,7 +34,7 @@ export async function generateReceiptDoc({ structured }) {
   // Work on a shallow copy to avoid mutating caller state
   const f = { ...fIn };
 
-  // Minimal validation BEFORE numbering (don’t consume a number if invalid)
+  // Minimal validation BEFORE numbering (donâ€™t consume a number if invalid)
   if (f.amount == null || isNaN(Number(f.amount))) {
     throw new Error("Receipt requires a numeric amount.");
   }
@@ -38,9 +44,11 @@ export async function generateReceiptDoc({ structured }) {
   // Normalize amount
   f.amount = twoDp(f.amount);
 
-  // Get receipt number from series service if not already provided
-  const receiptNo = f.receiptNo || (await getNextNumber("receipt"));
-  f.receiptNo = receiptNo;
+  // âœ… Prefer reserved number from preview snapshot
+  const reserved = f.number || f.receiptNo;
+  const receiptNo = reserved || (await getNextNumber("receipt"));
+  f.receiptNo = receiptNo; // keep legacy field populated
+  f.number = receiptNo;    // keep new field populated for consistency
 
   const company = f.company || process.env.COMPANY_NAME || "Your Company";
 

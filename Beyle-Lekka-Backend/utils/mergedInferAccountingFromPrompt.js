@@ -1,30 +1,33 @@
-import axios from "axios";
+﻿import axios from "axios";
 import OpenAI from "openai";
 import dotenv from "dotenv";
 dotenv.config();
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Placeholder currency symbol (to be upgraded with session-based value)
+// Placeholder currency symbol (session-based upgrade later if needed)
 const currencySymbol = "₹";
 
 const today = new Date().toISOString().split("T")[0]; // e.g., 2025-06-07
 
-// ------------------------ SYSTEM INSTRUCTIONS (revised) ------------------------
+// ------------------------ SYSTEM INSTRUCTIONS (revised, inbound-only) ------------------------
 const SYSTEM_INSTRUCTIONS = `
 Assume today's system date is ${today}. Convert relative or partial dates like "yesterday", "6th June", or "today" into full YYYY-MM-DD using this reference date.
 
 You are the in-house accountant assisting the user in maintaining the financial books of their own business (any legal entity). Classify and post double-entry journals that comply with Indian Accounting Standards (Ind AS) and universally accepted accounting heads.
 
-You ALSO extract document fields for a business document when the prompt implies one:
-- Supported doc types: "invoice", "receipt", "payment_voucher" (if none applies, use "none").
-- For "invoice", capture: buyer, date (YYYY-MM-DD), items[{name, qty, rate, amount(optional)}], paymentMode, taxes(optional), narration(optional), totalAmount(optional).
+You ALSO extract document fields for a business document when the prompt implies one (INBOUND ONLY):
+- Supported doc types (inbound): "invoice" (meaning vendor/purchase invoice only), "receipt" (receipt issued by others acknowledging our inward money), "payment_voucher" (our outward payment record). If none applies, use "none".
+- Do NOT create outbound documents (our own sales invoices / outward delivery notes) here; those are created by the system elsewhere. If the prompt describes our own invoice issuance or an outbound doc, set docType:"none".
+
+- For "invoice" (vendor), capture: buyer, date (YYYY-MM-DD), items[{name, qty, rate, amount(optional)}], paymentMode, taxes(optional), narration(optional), totalAmount(optional).
 - For "receipt", capture: receivedFrom, amount, date (YYYY-MM-DD), mode, towards(optional), narration(optional).
-- For "payment_voucher", capture: payee, amount, date (YYYY-MM-DD), mode, purpose(optional), narration(optional).
+- For "payment_voucher", capture: payee(optional), amount, date (YYYY-MM-DD), mode, purpose(optional), narration(optional).
 
 RULES (STRICT):
 1) Return structured data only. Do not include chain-of-thought, explanations, or commentary outside the structured fields.
-2) Never invent unknown values. If a critical detail for JE or for the document is missing or ambiguous (date, amount, counterparty/buyer/payee/receivedFrom, payment mode, or invoice items), request ONE concise clarification instead of posting a journal.
+2) Never invent unknown values. If a critical detail for JE or for the document is missing or ambiguous (date, amount, counterparty/buyer/receivedFrom, payment mode, or invoice items), request ONE concise clarification instead of posting a journal.
+   Exception: For everyday expenses (electricity, water, telecom, internet, fuel, petrol/diesel, tolls, parking, subscriptions, bank charges, petty cash, ride-hailing), if user gives date+amount+mode and does not name a payee, DO NOT ask "paid who?" — leave payee empty and proceed.
 3) Required for any posted journal:
    - Each line must include: date (YYYY-MM-DD), account (string), debit (number >= 0), credit (number >= 0).
    - For each line, exactly one of {debit, credit} must be > 0 (XOR). Zero-value lines are not allowed.
@@ -34,7 +37,7 @@ RULES (STRICT):
 6) Output format is controlled by the caller via tool input schema (for Claude) or JSON mode (for fallbacks). Follow it exactly.
 
 RESPONSE MODES:
-- SUCCESS: Provide a balanced journal (array of lines), a short layman "explanation", the "docType", and "documentFields" for that docType (or docType:"none" with empty fields if no doc should be created).
+- SUCCESS: Provide a balanced journal (array of lines), a short layman "explanation", the "docType" in {"invoice","receipt","payment_voucher","none"}, and "documentFields" for that docType (or docType:"none" with empty fields if no doc should be created).
 - FOLLOWUP_NEEDED: Provide a single "clarification" string explaining precisely what is missing. If known, also return the inferred "docType".
 
 IMPORTANT:
@@ -118,7 +121,8 @@ const OUTPUT_SCHEMA = {
         payment_voucher: {
           type: "object",
           additionalProperties: false,
-          required: ["payee", "amount", "date", "mode"],
+          // NOTE: payee is OPTIONAL to avoid the "Paid who?" loop on everyday expenses
+          required: ["amount", "date", "mode"],
           properties: {
             payee: { type: "string", minLength: 1 },
             amount: { type: "number", minimum: 0 },
@@ -227,6 +231,11 @@ function sanitizeDocumentFields(docType, documentFields) {
     });
   }
 
+  // Make payee an explicit empty string when omitted (for UI nicety)
+  if (docType === "payment_voucher" && (df.payee == null)) {
+    df.payee = "";
+  }
+
   return { [docType]: df };
 }
 
@@ -234,7 +243,6 @@ function sanitizeDocumentFields(docType, documentFields) {
 export const inferJournalEntriesFromPrompt = async (userPrompt, promptType = "") => {
   let usedFallback = null;
 
-  // Keep prompt simple & deterministic; all instructions live in SYSTEM_INSTRUCTIONS
   const fullPrompt = `
 User Prompt:
 """${userPrompt}"""
@@ -242,15 +250,15 @@ User Prompt:
 Caller Hint (may be empty): docType="${promptType || "none"}"
 
 TASK:
-1) If all critical info for BOTH the journal and the document (if applicable) is present, output status "success" with:
+1) INBOUND ONLY — If all critical info for BOTH the journal and the document (if applicable) is present, output status "success" with:
    - a balanced journal
    - a short layman explanation
-   - docType in {"invoice","receipt","payment_voucher","none"}
+   - docType in {"invoice","receipt","payment_voucher","none"} where "invoice" == vendor/purchase invoice only
    - documentFields keyed by that docType (or empty if "none")
 2) If anything critical is missing/ambiguous (date, amount, counterparty, payment mode, invoice items), output status "followup_needed" with ONE concise clarification question. If you can infer the docType from the user prompt, include that docType; otherwise "none".
 `.trim();
 
-  console.log("🧠 Running inference → Claude primary (tool/schema), GPT fallback (JSON mode), OpenRouter secondary fallback");
+  console.log("Running inference → Claude primary (tool/schema), GPT fallback (JSON mode), OpenRouter secondary fallback");
 
   // ---------- Claude PRIMARY (forced tool-use with input_schema) ----------
   const claudePromise = axios.post(
@@ -258,7 +266,7 @@ TASK:
     {
       model: "claude-3-opus-20240229",
       max_tokens: 1200,
-      temperature: 0, // determinism
+      temperature: 0,
       system: SYSTEM_INSTRUCTIONS,
       messages: [{ role: "user", content: fullPrompt }],
       tools: [
@@ -268,7 +276,7 @@ TASK:
           input_schema: OUTPUT_SCHEMA
         }
       ],
-      tool_choice: { type: "tool", name: "produce_output" } // force JSON via tool
+      tool_choice: { type: "tool", name: "produce_output" }
     },
     {
       headers: {
@@ -284,7 +292,7 @@ TASK:
     model: "gpt-4-1106-preview",
     temperature: 0,
     top_p: 1,
-    seed: 42, // best-effort reproducibility
+    seed: 42,
     response_format: { type: "json_object" },
     messages: [
       { role: "system", content: SYSTEM_INSTRUCTIONS },
@@ -321,7 +329,7 @@ TASK:
       );
       return res.data.choices?.[0]?.message?.content?.trim() || "";
     } catch (err) {
-      console.error("🟥 OpenRouter failed:", err.message);
+      console.error("OpenRouter failed:", err.message);
       return "";
     }
   };
@@ -334,16 +342,15 @@ TASK:
 
     if (claudeRes.status === "fulfilled") {
       const blocks = claudeRes.value?.data?.content || [];
-      // Find the tool_use block for "produce_output"
       const toolUse = blocks.find((b) => b?.type === "tool_use" && b?.name === "produce_output");
       if (toolUse?.input) {
-        candidate = toolUse.input; // already an object per input_schema
-        console.log("🟣 Claude (tool) JSON received.");
+        candidate = toolUse.input;
+        console.log("Claude (tool) JSON received.");
       } else {
-        console.warn("🟠 Claude fulfilled but no tool_use content; falling back.");
+        console.warn("Claude fulfilled but no tool_use content; falling back.");
       }
     } else {
-      console.error("❌ Claude error:", claudeRes.reason?.message || "unknown");
+      console.error("Claude error:", claudeRes.reason?.message || "unknown");
     }
 
     // If no Claude JSON, try OpenAI JSON mode
@@ -352,12 +359,12 @@ TASK:
         const txt = gptRes.value?.choices?.[0]?.message?.content?.trim() || "";
         candidate = txt ? JSON.parse(txt) : null;
         usedFallback = "gpt";
-        console.log("🔵 GPT (JSON mode) JSON received.");
+        console.log("GPT (JSON mode) JSON received.");
       } catch (e) {
-        console.warn("🟠 GPT JSON parse failed:", e.message);
+        console.warn("GPT JSON parse failed:", e.message);
       }
     } else if (!candidate && gptRes.status !== "fulfilled") {
-      console.error("❌ GPT error:", gptRes.reason?.message || "unknown");
+      console.error("GPT error:", gptRes.reason?.message || "unknown");
     }
 
     // If still nothing, use OpenRouter string and parse
@@ -370,9 +377,9 @@ TASK:
         const jsonRaw = match ? match[0] : cleaned;
         try {
           candidate = JSON.parse(jsonRaw);
-          console.log("🟢 OpenRouter JSON parsed.");
+          console.log("OpenRouter JSON parsed.");
         } catch (e) {
-          console.warn("🟠 OpenRouter JSON parse failed.");
+          console.warn("OpenRouter JSON parse failed.");
         }
       }
     }
@@ -385,12 +392,14 @@ TASK:
     if (String(candidate.status).toLowerCase() === "followup_needed") {
       const clarification =
         (candidate && typeof candidate.clarification === "string" && candidate.clarification.trim()) ||
-        "Please provide the missing date, amount, counterparty/buyer/payee, payment mode, or invoice items.";
+        "Please provide the missing date, amount, counterparty/buyer/receivedFrom, payment mode, or invoice items.";
       const docType =
         (typeof candidate.docType === "string" && ["invoice","receipt","payment_voucher","none"].includes(candidate.docType))
           ? candidate.docType
           : (promptType && ["invoice","receipt","payment_voucher"].includes(promptType) ? promptType : "none");
 
+      // Inbound-only enforcement: if model guessed an outbound sales invoice, do not force "invoice"
+      // (light guard — we rely primarily on SYSTEM_INSTRUCTIONS)
       return {
         status: "followup_needed",
         clarification,
@@ -418,7 +427,6 @@ TASK:
       : "none";
 
     if (docType === "none" && ["invoice","receipt","payment_voucher"].includes(promptType)) {
-      // Only bias with caller hint if the model gave "none"
       docType = promptType;
     }
 
@@ -444,7 +452,7 @@ TASK:
       fallbackUsed: usedFallback
     };
   } catch (err) {
-    console.error("❌ Parsing/validation failed:", err.message);
+    console.error("Parsing/validation failed:", err.message);
     return {
       status: "fallback_to_manual",
       message: "Could not parse a valid accounting output.",

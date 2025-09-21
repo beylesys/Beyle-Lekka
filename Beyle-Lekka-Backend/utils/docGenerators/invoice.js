@@ -1,4 +1,4 @@
-// utils/docGenerators/invoice.js
+﻿// utils/docGenerators/invoice.js
 import fs from "fs";
 import path from "path";
 import { v4 as uuidv4 } from "uuid";
@@ -14,13 +14,13 @@ import {
   WidthType
 } from "docx";
 import dotenv from "dotenv";
-import { getNextNumber } from "../../services/series.js"; // ← numbering service
+import { getNextNumber } from "../../services/series.js"; // numbering service (fallback only)
 dotenv.config();
 
 const OUTPUT_DIR = path.resolve("./generated_docs");
 if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
-const CURRENCY = process.env.CURRENCY_SYMBOL || "₹";
+const CURRENCY = process.env.CURRENCY_SYMBOL || "â‚¹";
 
 function twoDp(n) {
   const x = Number(n);
@@ -31,6 +31,12 @@ function sanitizeForFilename(s) {
   return String(s).replace(/[^a-z0-9\-_.]/gi, "-");
 }
 
+/**
+ * Accepts a pre-reserved number (from preview snapshot) via:
+ *   structured.documentFields.invoice.number  (preferred)
+ * or structured.documentFields.invoice.invoiceNo (legacy)
+ * Falls back to getNextNumber("invoice") ONLY if neither is provided.
+ */
 export async function generateInvoiceDoc({ structured }) {
   const fIn = structured?.documentFields?.invoice;
   if (!fIn) throw new Error("Missing documentFields.invoice");
@@ -38,14 +44,14 @@ export async function generateInvoiceDoc({ structured }) {
   // work on a shallow copy to avoid mutating caller state
   const f = { ...fIn };
 
-  // Minimal validation before numbering (don’t consume a number if invalid)
+  // Minimal validation before numbering (donâ€™t consume a number if invalid)
   if (!Array.isArray(f.items) || f.items.length === 0) {
     throw new Error("Invoice requires at least one item.");
   }
   if (!f.buyer) throw new Error("Invoice requires buyer.");
   if (!f.date) throw new Error("Invoice requires date (YYYY-MM-DD).");
 
-  // Compute line amounts if absent (qty * rate). This is deterministic and not invention.
+  // Compute line amounts if absent (qty * rate). Deterministic; no invention.
   f.items = f.items.map((it) => {
     const name = String(it.name || "").trim();
     const qty = Number(it.qty || 0);
@@ -63,9 +69,13 @@ export async function generateInvoiceDoc({ structured }) {
     f.totalAmount = twoDp(f.totalAmount);
   }
 
-  // Get invoice number from series service if not already provided
-  const invoiceNo = f.invoiceNo || (await getNextNumber("invoice"));
-  f.invoiceNo = invoiceNo;
+  // âœ… Prefer reserved number from preview snapshot
+  //    - f.number (new, preferred) OR f.invoiceNo (legacy)
+  //    - fallback to getNextNumber only if neither provided
+  const reserved = f.number || f.invoiceNo;
+  const invoiceNo = reserved || (await getNextNumber("invoice"));
+  f.invoiceNo = invoiceNo;          // keep legacy field populated
+  f.number = invoiceNo;             // keep new field populated for consistency
 
   const sellerName = f.sellerName || process.env.COMPANY_NAME || "Your Company";
   const sellerAddress = f.sellerAddress || process.env.COMPANY_ADDRESS || "";

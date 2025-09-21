@@ -1,0 +1,11 @@
+﻿import schema from "../rules/base/schema.js";
+import balance from "../rules/base/balance.js";
+import ledgerTypes from "../rules/accounting/ledgerTypes.js";
+import periodDate from "../rules/accounting/periodDate.js";
+import bankCash from "../rules/accounting/bankCash.js";
+import totals from "../rules/accounting/totals.js";
+import gstCore from "../rules/tax/gstCore.js";
+import stockGuards from "../rules/inventory/stockGuards.js";
+import duplicateInvoice from "../rules/crossDoc/duplicateInvoice.js";
+import idempotency from "../rules/accounting/idempotency.js";
+export default [schema,balance,ledgerTypes,periodDate,bankCash,totals,gstCore,stockGuards,duplicateInvoice,idempotency];

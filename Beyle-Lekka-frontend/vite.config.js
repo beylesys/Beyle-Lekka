@@ -9,11 +9,15 @@ export default defineConfig({
     port: 5173,
     strictPort: true,
     proxy: {
-      // API + health already working
-      '/api':    { target: backend, changeOrigin: true },
+      '/api': {
+        target: backend,
+        changeOrigin: true,
+        configure(proxy) {
+          proxy.on('proxyReq', (_proxyReq, req) => console.log('[vite →]', req.method, req.url))
+          proxy.on('proxyRes', (res, req) => console.log('[vite ←]', res.statusCode, req.method, req.url))
+        }
+      },
       '/health': { target: backend, changeOrigin: true },
-
-      // NEW: serve generated documents from backend
       '/files':  { target: backend, changeOrigin: true },
     }
   }

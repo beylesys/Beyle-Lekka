@@ -1,0 +1,18 @@
+{
+  "timezone": "Asia/Kolkata",
+  "allowFutureDates": false,
+  "backdateWindowDays": 7,
+  "closedPeriods": [],
+  "cashDoubleConfirmThreshold": 20000,
+  "requireBankInstrumentDetails": true,
+  "roundingMode": "HALF_UP",
+  "gst": { "enabled": true, "assumeIntraIfUnknown": true },
+  "inventory": { "enabled": true, "blockNegativeStock": true },
+  "tds": {
+    "enabled": true,
+    "applyOn": "amountExcludingGST",
+    "noPanRateOverride": 0.20,
+    "rates": { "194C": 0.01, "194J": 0.10, "194H": 0.05 },
+    "requireLedger": "TDS Payable"
+  }
+}

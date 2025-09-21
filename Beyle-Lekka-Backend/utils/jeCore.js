@@ -1,4 +1,4 @@
-// utils/jeCore.js
+﻿// utils/jeCore.js
 import { query } from "../services/db.js";
 
 /* ---------- utilities ---------- */
@@ -43,7 +43,7 @@ async function accountExists(nameOrCode) {
 function coerceToSingleLine(journal) {
   if (!Array.isArray(journal)) return [];
 
-  // Heuristic: if ≥50% rows look like {debit_account, credit_account, amount}, expand them
+  // Heuristic: if â‰¥50% rows look like {debit_account, credit_account, amount}, expand them
   let pairCount = 0;
   for (const l of journal) {
     if (l && (l.debit_account || l.debitAccount) && (l.credit_account || l.creditAccount) && ("amount" in l || "value" in l)) {

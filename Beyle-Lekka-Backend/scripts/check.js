@@ -1,4 +1,4 @@
-// scripts/check.js
+﻿// scripts/check.js
 import dotenv from "dotenv";
 dotenv.config();
 

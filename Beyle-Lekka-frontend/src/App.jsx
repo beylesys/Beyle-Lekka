@@ -1,117 +1,54 @@
-import React, { useState, useEffect } from "react";
+// src/App.jsx
+import React, { useState } from "react";
+import { BrowserRouter, Routes, Route, Link, useLocation } from "react-router-dom";
+import { Box, AppBar, Toolbar, Typography, Button } from "@mui/material";
+
 import { PromptProvider } from "./context/PromptContext.jsx";
 import UniversalPromptBar from "./components/UniversalPromptBar";
 import PromptThreadPane from "./components/PromptThreadPane";
-// swap LedgerViewer for the new Reports drawer
 import ReportsDrawer from "./components/ReportsDrawer";
+import DocumentUpload from "./components/DocumentUpload";
+import BankReconciliation from "./components/BankReconciliation";
 
-import {
-  Box,
-  AppBar,
-  Toolbar,
-  Typography,
-  Button,
-  Drawer,
-  Divider,
-} from "@mui/material";
-import MenuBookIcon from "@mui/icons-material/MenuBook";
-
-// 🔁 NEW: tiny helper that pings your backend via Vite proxy (/health → :3000)
-import { ping } from "./services/ping";
-
-function App() {
-  const [reportsOpen, setReportsOpen] = useState(false);
-
-  // 🔁 NEW: backend status banner
-  const [status, setStatus] = useState("checking…");
-  useEffect(() => {
-    ping()
-      .then((d) => setStatus(`OK: ${d.time || ""}`))
-      .catch((e) => setStatus(`ERR: ${e.message}`));
-  }, []);
-
+function Nav() {
+  const { pathname } = useLocation();
+  const tab = (p) => (pathname === p ? "contained" : "text");
   return (
-    <PromptProvider>
-      {/* Top app bar */}
-      <AppBar position="sticky" elevation={0} color="default">
-        <Toolbar sx={{ gap: 1 }}>
-          <Typography variant="h6" sx={{ flexGrow: 1, fontWeight: 700 }}>
-            Beyle-Lekka
-          </Typography>
-
-          <Button
-            variant="contained"
-            startIcon={<MenuBookIcon />}
-            onClick={() => setReportsOpen(true)}
-            sx={{ borderRadius: 2 }}
-          >
-            Reports
-          </Button>
-        </Toolbar>
-      </AppBar>
-
-      {/* 🔁 NEW: simple backend status line */}
-      <Box
-        sx={{
-          p: 1,
-          borderBottom: "1px solid #eee",
-          fontFamily: "monospace",
-          bgcolor: "#fafafa",
-        }}
-      >
-        Backend: {status}
-      </Box>
-
-      {/* Main content column: ONLY prompt + results */}
-      <Box
-        display="flex"
-        flexDirection="column"
-        height="calc(100vh - 64px)"
-        sx={{ overflow: "hidden" }}
-      >
-        {/* Thread fills available space */}
-        <Box flex={1} minHeight={0} sx={{ overflow: "auto" }}>
-          <PromptThreadPane />
-        </Box>
-
-        {/* Prompt bar fixed at the bottom */}
-        <Box
-          borderTop="1px solid #eee"
-          p={2}
-          position="sticky"
-          bottom={0}
-          bgcolor="white"
-          zIndex={1}
-        >
-          <UniversalPromptBar />
-        </Box>
-      </Box>
-
-      {/* Right drawer for Reports (Ledger / TB / P&L / BS) */}
-      <Drawer
-        anchor="right"
-        open={reportsOpen}
-        onClose={() => setReportsOpen(false)}
-        PaperProps={{ sx: { width: { xs: "100%", sm: 700 } } }}
-      >
-        <Box
-          p={2}
-          display="flex"
-          alignItems="center"
-          justifyContent="space-between"
-        >
-          <Typography variant="h6" fontWeight={700}>
-            Reports
-          </Typography>
-          <Button onClick={() => setReportsOpen(false)}>Close</Button>
-        </Box>
-        <Divider />
-        <Box sx={{ p: 2, height: "100%", overflow: "auto" }}>
-          <ReportsDrawer sessionId="default-session" />
-        </Box>
-      </Drawer>
-    </PromptProvider>
+    <AppBar position="static">
+      <Toolbar>
+        <Typography variant="h6" sx={{ flexGrow: 1, fontWeight: 700 }}>Beyle Lekka</Typography>
+        <Button color="inherit" component={Link} to="/" variant={tab("/")}>Prompt</Button>
+        <Button color="inherit" component={Link} to="/reports" variant={tab("/reports")}>Reports</Button>
+        <Button color="inherit" component={Link} to="/docs" variant={tab("/docs")}>Docs</Button>
+        <Button color="inherit" component={Link} to="/bank-reco" variant={tab("/bank-reco")}>Bank Reco</Button>
+      </Toolbar>
+    </AppBar>
   );
 }
 
-export default App;
+function PromptPage() {
+  return (
+    <Box sx={{ p: 2 }}>
+      <UniversalPromptBar />
+      <PromptThreadPane />
+    </Box>
+  );
+}
+
+export default function App() {
+  return (
+    <PromptProvider>
+      <BrowserRouter>
+        <Nav />
+        <Box sx={{ p: 2 }}>
+          <Routes>
+            <Route path="/" element={<PromptPage />} />
+            <Route path="/reports" element={<ReportsDrawer sessionId="default-session" />} />
+            <Route path="/docs" element={<DocumentUpload sessionId="default-session" />} />
+            <Route path="/bank-reco" element={<BankReconciliation />} />
+          </Routes>
+        </Box>
+      </BrowserRouter>
+    </PromptProvider>
+  );
+}

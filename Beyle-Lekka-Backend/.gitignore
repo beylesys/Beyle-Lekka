@@ -136,3 +136,10 @@ dist
 .vscode/
 .local/
 .replit
+
+.env
+*.db
+*.db-*
+/generated_docs
+/uploads
+node_modules

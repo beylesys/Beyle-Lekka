@@ -1,28 +1,29 @@
-// Beyle-Lekka-Backend/controllers/getLedgerView.js
+﻿// controllers/getLedgerView.js
 import { query } from "../services/db.js";
 
 export const getLedgerView = async (_req, res) => {
   try {
     const { rows = [] } = await query(
-      `SELECT transaction_date, debit_account, credit_account, amount, narration
-       FROM ledger_entries
-       ORDER BY transaction_date ASC`
+      `SELECT id, transaction_date, debit_account, credit_account, amount, narration
+         FROM ledger_entries_view
+         ORDER BY transaction_date ASC, created_at ASC`
     );
 
-    // Build ledgerView even if empty
     const ledgerLines = rows
-      .map(e =>
+      .map((e) =>
         `${e.transaction_date || ""}|${e.debit_account || ""}|${e.credit_account || ""}|${e.amount ?? ""}|${e.narration || ""}`
       )
       .join("\n");
 
     return res.status(200).json({
       ok: true,
-      entries: rows,          // [] when no data
-      ledgerView: ledgerLines // "" when no data
+      entries: rows,
+      ledgerView: ledgerLines,
     });
   } catch (error) {
-    console.error("❌ getLedgerView failed:", error);
-    return res.status(500).json({ ok: false, error: error?.message || "Error fetching ledger view." });
+    console.error("getLedgerView failed:", error);
+    return res
+      .status(500)
+      .json({ ok: false, error: error?.message || "Error fetching ledger view." });
   }
 };

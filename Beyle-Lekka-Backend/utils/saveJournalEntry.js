@@ -1,4 +1,4 @@
-// utils/saveJournalEntry.js
+﻿// utils/saveJournalEntry.js
 import { query } from "../services/db.js";
 import { randomUUID } from "crypto";
 
@@ -48,7 +48,7 @@ export const saveJournalEntry = async (journalEntries, sessionId, prompt) => {
 
     return { status: "success", message: `${insertCount} entries saved to ledger.` };
   } catch (error) {
-    console.error("❌ FULL LEDGER INSERT ERROR:", error);
+    console.error("âŒ FULL LEDGER INSERT ERROR:", error);
     return { status: "error", message: "Failed to save entries", error: error.message };
   }
 };

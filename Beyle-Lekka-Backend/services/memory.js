@@ -1,4 +1,4 @@
-// services/memory.js (SQLite-ready, matches migration with `result` column)
+﻿// services/memory.js (SQLite-ready, matches migration with `result` column)
 import { query } from "./db.js";
 
 const safeParse = (v) => {
@@ -6,7 +6,7 @@ const safeParse = (v) => {
   try { return JSON.parse(v); } catch { return v; }
 };
 
-// ✅ Store new memory record
+// âœ… Store new memory record
 async function store(
   sessionId,
   {
@@ -19,7 +19,7 @@ async function store(
   }
 ) {
   try {
-    console.log("🧠 Attempting to store memory with values:", {
+    console.log("ðŸ§  Attempting to store memory with values:", {
       sessionId, userId, prompt, result, type, status, source
     });
 
@@ -39,13 +39,13 @@ async function store(
       ]
     );
 
-    console.log("✅ Memory stored successfully for session:", sessionId);
+    console.log("âœ… Memory stored successfully for session:", sessionId);
   } catch (err) {
-    console.error("❌ FULL MEMORY LOG ERROR:", err);
+    console.error("âŒ FULL MEMORY LOG ERROR:", err);
   }
 }
 
-// 🔁 Update memory status (e.g., after confirmation)
+// ðŸ” Update memory status (e.g., after confirmation)
 async function updateStatus(sessionId, newStatus = "confirmed") {
   try {
     await query(
@@ -54,13 +54,13 @@ async function updateStatus(sessionId, newStatus = "confirmed") {
        WHERE session_id = $2`,
       [newStatus, sessionId]
     );
-    console.log(`🧠 Memory status updated → ${newStatus} for session ${sessionId}`);
+    console.log(`ðŸ§  Memory status updated â†’ ${newStatus} for session ${sessionId}`);
   } catch (err) {
-    console.error("❌ Error updating memory status:", err);
+    console.error("âŒ Error updating memory status:", err);
   }
 }
 
-// 📥 Get memory by session (optional utility)
+// ðŸ“¥ Get memory by session (optional utility)
 async function getBySession(sessionId) {
   try {
     const { rows } = await query(
@@ -71,7 +71,7 @@ async function getBySession(sessionId) {
     if (row) row.result = safeParse(row.result); // <-- parse TEXT -> JSON
     return row;
   } catch (err) {
-    console.error("❌ Error fetching memory by session:", err);
+    console.error("âŒ Error fetching memory by session:", err);
     return null;
   }
 }

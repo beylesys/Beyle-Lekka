@@ -6,21 +6,81 @@ import {
 import EditIcon from "@mui/icons-material/Edit";
 import CloseIcon from "@mui/icons-material/Close";
 import { usePrompt } from "../context/PromptContext";
-import { confirmEntry, orchestratePrompt as orchestrateAPI } from "../services/apiService";
-import { BASE_URL } from "../services/apiService";
+import {
+  confirmEntry,                // legacy fallback
+  confirmFromPreview,          // ✅ new snapshot confirm
+  orchestratePrompt as orchestrateAPI,
+  BASE_URL,
+  makeIdemKey,
+} from "../services/apiService";
 
 const filesBase = (BASE_URL || "").replace(/\/api\/?$/, "");
 
+// ---------- helpers ----------
+const toNum = (v, d = 0) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : d;
+};
+
+// Pretty-print arrays/objects for alerts
+const pretty = (val) => {
+  if (val == null) return "";
+  if (Array.isArray(val)) return val.map(pretty).join("; ");
+  if (typeof val === "object") {
+    // common shapes: {message}, {error}, {code, message, meta}, {field, msg}
+    return (
+      val.message ||
+      val.error ||
+      (val.field && val.msg && `${val.field}: ${val.msg}`) ||
+      (val.code && val.meta && `${val.code} ${JSON.stringify(val.meta)}`) ||
+      val.code ||
+      JSON.stringify(val)
+    );
+  }
+  return String(val);
+};
+
+const normalizeDocFields = (docType, documentFields) => {
+  const dt = typeof docType === "string" ? docType : "none";
+  const df = documentFields && typeof documentFields === "object" ? documentFields : {};
+  if (dt === "none") return {};
+  return df[dt] ? df : { [dt]: df };
+};
+
 const pickDocFields = (docType, documentFields) => {
-  if (!docType || docType === "none" || !documentFields) return null;
-  if (documentFields[docType]) return documentFields[docType];
+  if (!docType || docType === "none") return null;
+  const norm = normalizeDocFields(docType, documentFields);
+  if (norm[docType]) return norm[docType];
+
+  // extra leniency for PV synonyms
   if (docType === "payment_voucher") {
-    if (documentFields.payment_voucher) return documentFields.payment_voucher;
-    if (documentFields.voucher) return documentFields.voucher;
+    if (norm.payment_voucher) return norm.payment_voucher;
+    if (norm.voucher) return norm.voucher;
   }
   return null;
 };
 
+// Try to surface a reserved number in preview
+const getPreviewNumber = (docType, item) => {
+  const raw = item?.raw || {};
+  const p = item?.preview || raw.preview || null; // server-side preview model
+  if (p?.number) return p.number;
+
+  // Fallback to documentFields
+  const df = item?.documentFields || raw.documentFields || {};
+  const f = pickDocFields(docType, df) || {};
+  return (
+    f.number ||
+    f.invoiceNo ||
+    f.receiptNo ||
+    f.voucherNo ||
+    f.no ||
+    f.id ||
+    null
+  );
+};
+
+// ---------- DocumentPreview ----------
 const DocumentPreview = ({ docType, documentFields }) => {
   if (!docType || docType === "none") return null;
   const f = pickDocFields(docType, documentFields);
@@ -29,14 +89,14 @@ const DocumentPreview = ({ docType, documentFields }) => {
   if (docType === "invoice") {
     const items = Array.isArray(f.items) ? f.items : [];
     const subtotal = items.reduce((s, it) => {
-      const qty = Number(it && it.qty != null ? it.qty : 0);
-      const rate = Number(it && it.rate != null ? it.rate : 0);
-      const hasAmount = !!(it && it.amount != null);
-      const line = hasAmount ? Number(it.amount) : qty * rate;
-      return s + (Number.isFinite(line) ? line : 0);
+      const qty = toNum(it?.qty);
+      const rate = toNum(it?.rate);
+      const hasAmount = it && it.amount != null;
+      const line = hasAmount ? toNum(it.amount) : qty * rate;
+      return s + toNum(line);
     }, 0);
-    const taxes = Number(f && f.taxes != null ? f.taxes : 0);
-    const total = (f && f.totalAmount != null && Number.isFinite(Number(f.totalAmount)))
+    const taxes = toNum(f?.taxes);
+    const total = Number.isFinite(Number(f?.totalAmount))
       ? Number(f.totalAmount)
       : subtotal + taxes;
 
@@ -45,8 +105,8 @@ const DocumentPreview = ({ docType, documentFields }) => {
         <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 1 }}>
           <Chip size="small" label="Invoice Preview" />
         </Box>
-        <Typography variant="subtitle2">Buyer: {(f && f.buyer) || "-"}</Typography>
-        <Typography variant="body2" color="text.secondary">Date: {(f && f.date) || "-"}</Typography>
+        <Typography variant="subtitle2">Buyer: {f?.buyer || "-"}</Typography>
+        <Typography variant="body2" color="text.secondary">Date: {f?.date || "-"}</Typography>
         <Divider sx={{ my: 1 }} />
         <table style={{ width: "100%", borderCollapse: "collapse" }}>
           <thead>
@@ -56,17 +116,15 @@ const DocumentPreview = ({ docType, documentFields }) => {
           </thead>
           <tbody>
             {items.map((it, i) => {
-              const qty = Number(it && it.qty != null ? it.qty : 0);
-              const rate = Number(it && it.rate != null ? it.rate : 0);
-              const hasAmount = !!(it && it.amount != null);
-              const amount = hasAmount ? Number(it.amount) : qty * rate;
-              const safeAmt = Number.isFinite(amount) ? amount : 0;
+              const qty = toNum(it?.qty);
+              const rate = toNum(it?.rate);
+              const amount = it?.amount != null ? toNum(it.amount) : qty * rate;
               return (
                 <tr key={i}>
-                  <td>{(it && it.name) || "Item"}</td>
+                  <td>{it?.name || "Item"}</td>
                   <td align="center">{qty}</td>
                   <td align="right">₹{rate.toFixed(2)}</td>
-                  <td align="right">₹{safeAmt.toFixed(2)}</td>
+                  <td align="right">₹{toNum(amount).toFixed(2)}</td>
                 </tr>
               );
             })}
@@ -79,49 +137,51 @@ const DocumentPreview = ({ docType, documentFields }) => {
         </Box>
         <Box sx={{ display: "flex", justifyContent: "space-between" }}>
           <Typography variant="subtitle2">Total</Typography>
-          <Typography variant="subtitle2">₹{total.toFixed(2)}</Typography>
+          <Typography variant="subtitle2">₹{toNum(total).toFixed(2)}</Typography>
         </Box>
-        {f && f.paymentMode ? <Typography variant="caption" color="text.secondary">Mode: {f.paymentMode}</Typography> : null}
-        {f && f.narration ? <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>Narration: {f.narration}</Typography> : null}
+        {f?.paymentMode ? <Typography variant="caption" color="text.secondary">Mode: {f.paymentMode}</Typography> : null}
+        {f?.narration ? <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>Narration: {f.narration}</Typography> : null}
       </Box>
     );
   }
 
   if (docType === "receipt") {
-    const amt = Number(f && f.amount != null ? f.amount : 0);
+    const amt = toNum(f?.amount);
     return (
       <Box sx={{ border: "1px dashed #ccc", borderRadius: 1, p: 2, mt: 2, background: "#fff" }}>
         <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 1 }}>
           <Chip size="small" label="Receipt Preview" />
         </Box>
-        <Typography variant="subtitle2">Received From: {(f && f.receivedFrom) || "-"}</Typography>
-        <Typography variant="body2" color="text.secondary">Date: {(f && f.date) || "-"}</Typography>
+        <Typography variant="subtitle2">Received From: {f?.receivedFrom || "-"}</Typography>
+        <Typography variant="body2" color="text.secondary">Date: {f?.date || "-"}</Typography>
         <Divider sx={{ my: 1 }} />
         <Typography variant="body2">Amount: ₹{amt.toFixed(2)}</Typography>
-        <Typography variant="body2">Mode: {(f && f.mode) || "Unspecified"}</Typography>
-        {f && f.towards ? <Typography variant="body2">Towards: {f.towards}</Typography> : null}
-        {f && f.narration ? <Typography variant="caption" color="text.secondary">Narration: {f.narration}</Typography> : null}
+        <Typography variant="body2">Mode: {f?.mode || "Unspecified"}</Typography>
+        {f?.towards ? <Typography variant="body2">Towards: {f.towards}</Typography> : null}
+        {f?.narration ? <Typography variant="caption" color="text.secondary">Narration: {f.narration}</Typography> : null}
       </Box>
     );
   }
 
-  const pvAmt = Number(f && f.amount != null ? f.amount : 0);
+  // payment_voucher (or anything else routed here)
+  const pvAmt = toNum(f?.amount);
   return (
     <Box sx={{ border: "1px dashed #ccc", borderRadius: 1, p: 2, mt: 2, background: "#fff" }}>
       <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 1 }}>
         <Chip size="small" label="Payment Voucher Preview" />
       </Box>
-      <Typography variant="subtitle2">Payee: {(f && f.payee) || "-"}</Typography>
-      <Typography variant="body2" color="text.secondary">Date: {(f && f.date) || "-"}</Typography>
+      <Typography variant="subtitle2">Payee: {f?.payee || "-"}</Typography>
+      <Typography variant="body2" color="text.secondary">Date: {f?.date || "-"}</Typography>
       <Divider sx={{ my: 1 }} />
       <Typography variant="body2">Amount: ₹{pvAmt.toFixed(2)}</Typography>
-      <Typography variant="body2">Mode: {(f && f.mode) || "Unspecified"}</Typography>
-      {f && f.purpose ? <Typography variant="body2">Purpose: {f.purpose}</Typography> : null}
-      {f && f.narration ? <Typography variant="caption" color="text.secondary">Narration: {f.narration}</Typography> : null}
+      <Typography variant="body2">Mode: {f?.mode || "Unspecified"}</Typography>
+      {f?.purpose ? <Typography variant="body2">Purpose: {f.purpose}</Typography> : null}
+      {f?.narration ? <Typography variant="caption" color="text.secondary">Narration: {f.narration}</Typography> : null}
     </Box>
   );
 };
 
+// ---------- main ----------
 const PromptThreadPane = () => {
   const { thread, sessionId } = usePrompt();
   const bottomRef = useRef(null);
@@ -138,7 +198,6 @@ const PromptThreadPane = () => {
     const next = !prev;
     setEditMode((m) => ({ ...m, [cardIndex]: next }));
     if (!next) {
-      // closing editor clears local edits for that card
       setEdits((e) => {
         const copy = { ...e };
         delete copy[cardIndex];
@@ -155,8 +214,7 @@ const PromptThreadPane = () => {
       if (field === "account" || field === "narration" || field === "date") {
         patch[field] = String(value);
       } else if (field === "debit" || field === "credit") {
-        const n = Number(value);
-        patch[field] = Number.isFinite(n) ? n : 0;
+        patch[field] = toNum(value);
       }
       return { ...prev, [cardIndex]: { ...card, [rowIndex]: patch } };
     });
@@ -165,49 +223,57 @@ const PromptThreadPane = () => {
   const rePreview = async (cardIndex) => {
     const patch = edits[cardIndex] || {};
     try {
-      const payload = {
-        sessionId,
-        // prompt intentionally omitted → backend applies `edits` to the current draft
-        edits: patch
-      };
-      const data = await orchestrateAPI(payload);
-      // Let the global updater handle adding a new PREVIEW entry in the thread
-      // If your orchestrate caller is elsewhere, you can reload after this or surface a toast.
+      await orchestrateAPI({ sessionId, edits: patch });
       setEditMode((m) => ({ ...m, [cardIndex]: false }));
       setEdits((e) => {
         const copy = { ...e };
         delete copy[cardIndex];
         return copy;
       });
-      // no local state push here; the orchestrate entry will appear via context flow
     } catch (e) {
       console.error("Re-preview failed:", e);
       alert("Re-preview failed. Check console.");
     }
   };
 
-  const handleSave = async (journalRows, promptText, index, docType, documentFields) => {
+  // Prefer snapshot confirm; fallback to legacy confirm if handles missing
+  const handleSave = async (journalRows, promptText, index, docType, documentFields, item) => {
     try {
-      const payload = {
-        sessionId,
-        journal: journalRows,
-        prompt: typeof promptText === "string" ? promptText : "",
-        confirmed: true
-      };
-      if (docType && docType !== "none") {
-        payload.docType = docType;
-        payload.documentFields = documentFields || {};
+      const previewId = item?.previewId || item?.raw?.previewId || null;
+      const hash = item?.hash || item?.raw?.hash || null;
+
+      let res;
+      if (previewId && hash) {
+        res = await confirmFromPreview({
+          previewId,
+          hash,
+          sessionId,
+          prompt: typeof promptText === "string" ? promptText : undefined,
+          idempotencyKey: makeIdemKey(),
+        });
+      } else {
+        const payload = {
+          sessionId,
+          journal: journalRows,
+          prompt: typeof promptText === "string" ? promptText : "",
+          confirmed: true,
+        };
+        if (docType && docType !== "none") {
+          payload.docType = docType;
+          payload.documentFields = documentFields || {};
+        }
+        res = await confirmEntry(payload);
       }
-      const res = await confirmEntry(payload);
+
       if (res && res.success === true) {
         const doc = res.document || null;
         setSaveStatus((prev) => ({ ...prev, [index]: { status: "success", document: doc } }));
       } else {
-        const errMsg = res && res.error ? res.error : "Save failed";
+        const errMsg = res?.error || "Save failed";
         setSaveStatus((prev) => ({ ...prev, [index]: { status: "error", error: errMsg } }));
       }
     } catch (e) {
-      const errMsg = e && e.message ? e.message : "Save failed";
+      const errMsg = e?.error || e?.message || "Save failed";
       console.error("❌ Save failed:", e);
       setSaveStatus((prev) => ({ ...prev, [index]: { status: "error", error: errMsg } }));
     }
@@ -224,13 +290,13 @@ const PromptThreadPane = () => {
   return (
     <Box id="thread-pane" sx={{ maxHeight: "100%", overflowY: "auto" }}>
       {thread.map((item, idx) => {
-        const kind = item && item.kind ? item.kind : null;
+        const kind = item?.kind || null;
 
         // Build displayPrompt
         let displayPrompt = "";
-        if (item && typeof item.prompt === "string" && item.prompt) {
+        if (typeof item?.prompt === "string" && item.prompt) {
           displayPrompt = item.prompt;
-        } else if (item && item.raw) {
+        } else if (item?.raw) {
           if (typeof item.raw.originalPrompt === "string" && item.raw.originalPrompt) {
             displayPrompt = item.raw.originalPrompt;
           } else if (typeof item.raw.prompt === "string" && item.raw.prompt) {
@@ -242,17 +308,20 @@ const PromptThreadPane = () => {
 
         // doc payload
         let docType = "none";
-        if (item && typeof item.docType === "string" && item.docType) {
+        if (typeof item?.docType === "string" && item.docType) {
           docType = item.docType;
-        } else if (item && item.raw && typeof item.raw.docType === "string" && item.raw.docType) {
+        } else if (typeof item?.raw?.docType === "string" && item.raw.docType) {
           docType = item.raw.docType;
         }
+
         let documentFields = {};
-        if (item && item.documentFields && typeof item.documentFields === "object") {
+        if (item?.documentFields && typeof item.documentFields === "object") {
           documentFields = item.documentFields;
-        } else if (item && item.raw && item.raw.documentFields && typeof item.raw.documentFields === "object") {
+        } else if (item?.raw?.documentFields && typeof item.raw.documentFields === "object") {
           documentFields = item.raw.documentFields;
         }
+
+        const reservedNumber = getPreviewNumber(docType, item);
 
         return (
           <Box key={idx} mb={3}>
@@ -268,7 +337,10 @@ const PromptThreadPane = () => {
                 <CardContent>
                   <Box sx={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                     <Typography variant="subtitle2">📒 Double-Entry Journal (AI)</Typography>
-                    <Box>
+                    <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+                      {reservedNumber ? (
+                        <Chip size="small" color="success" label={`No: ${reservedNumber}`} />
+                      ) : null}
                       <IconButton size="small" onClick={() => toggleEdit(idx)} aria-label="edit-preview">
                         {editMode[idx] ? <CloseIcon fontSize="small" /> : <EditIcon fontSize="small" />}
                       </IconButton>
@@ -304,29 +376,35 @@ const PromptThreadPane = () => {
                   ) : null}
 
                   {/* Row list OR inline editor */}
-                  {!editMode[idx] && item.journal.map((entry, j) => (
-                    <Box key={j} sx={{ ml: 2, mb: 1 }}>
-                      <Typography variant="body2">
-                        • {entry.account}: <strong>Debit ₹{entry.debit || 0}</strong> /{" "}
-                        <strong>Credit ₹{entry.credit || 0}</strong>
-                      </Typography>
-                      {entry.narration ? (
-                        <Typography variant="caption" color="text.secondary" sx={{ ml: 2 }}>
-                          {entry.narration}
+                  {!editMode[idx] && (Array.isArray(item.journal) && item.journal.length > 0 ? (
+                    item.journal.map((entry, j) => (
+                      <Box key={j} sx={{ ml: 2, mb: 1 }}>
+                        <Typography variant="body2">
+                          • {entry.account}: <strong>Debit ₹{toNum(entry.debit).toFixed(2)}</strong> /{" "}
+                          <strong>Credit ₹{toNum(entry.credit).toFixed(2)}</strong>
                         </Typography>
-                      ) : null}
-                    </Box>
+                        {entry.narration ? (
+                          <Typography variant="caption" color="text.secondary" sx={{ ml: 2 }}>
+                            {entry.narration}
+                          </Typography>
+                        ) : null}
+                      </Box>
+                    ))
+                  ) : (
+                    <Typography variant="caption" color="text.secondary" sx={{ ml: 2 }}>
+                      (no journal rows)
+                    </Typography>
                   ))}
 
                   {editMode[idx] ? (
                     <Box sx={{ mt: 1 }}>
                       {item.journal.map((row, rIdx) => {
                         const patch = (edits[idx] && edits[idx][rIdx]) || {};
-                        const accountVal = (patch.account != null ? patch.account : row.account);
-                        const debitVal = (patch.debit != null ? patch.debit : row.debit);
-                        const creditVal = (patch.credit != null ? patch.credit : row.credit);
-                        const dateVal = (patch.date != null ? patch.date : row.date);
-                        const narrVal = (patch.narration != null ? patch.narration : (row.narration || ""));
+                        const accountVal = patch.account != null ? patch.account : row.account;
+                        const debitVal = patch.debit != null ? patch.debit : row.debit;
+                        const creditVal = patch.credit != null ? patch.credit : row.credit;
+                        const dateVal = patch.date != null ? patch.date : row.date;
+                        const narrVal = patch.narration != null ? patch.narration : (row.narration || "");
 
                         return (
                           <Box key={rIdx} sx={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr 2fr", gap: 1, mb: 1 }}>
@@ -354,7 +432,7 @@ const PromptThreadPane = () => {
                       const doc = state && state.document;
 
                       if (isSuccess) {
-                        const href = doc && doc.url ? (doc.url.startsWith("http") ? doc.url : `${filesBase}${doc.url}`) : null;
+                        const href = doc?.url ? (doc.url.startsWith("http") ? doc.url : `${filesBase}${doc.url}`) : null;
                         return (
                           <Box sx={{ display: "flex", alignItems: "center", gap: 1, flexWrap: "wrap" }}>
                             <Alert severity="success">✅ Saved to ledger</Alert>
@@ -362,7 +440,7 @@ const PromptThreadPane = () => {
                               <>
                                 <Button variant="outlined" component="a" href={href} target="_blank" rel="noreferrer">Download .docx</Button>
                                 <Button variant="text" onClick={() => window.open(href, "_blank")}>Open / Print</Button>
-                                {doc && doc.number ? <Chip size="small" label={`${doc.docType || "doc"}: ${doc.number}`} /> : null}
+                                {doc?.number ? <Chip size="small" label={`${doc.docType || "doc"}: ${doc.number}`} /> : null}
                               </>
                             ) : null}
                           </Box>
@@ -374,7 +452,16 @@ const PromptThreadPane = () => {
                       return (
                         <Button
                           variant="contained"
-                          onClick={() => handleSave(item.journal, displayPrompt, idx, docType, documentFields)}
+                          onClick={() =>
+                            handleSave(
+                              item.journal,
+                              displayPrompt,
+                              idx,
+                              docType,
+                              documentFields,
+                              item // pass the item so we can read previewId/hash
+                            )
+                          }
                         >
                           Confirm & Save
                         </Button>
@@ -390,13 +477,68 @@ const PromptThreadPane = () => {
               <Card variant="outlined" sx={{ backgroundColor: "#fffde7" }}>
                 <CardContent>
                   <Typography variant="body2" sx={{ color: "#9e8500" }}>
-                    🤖 Clarification Needed: {(item && item.clarification) || "Please provide the missing detail."}
+                    🤖 Clarification Needed: {item?.clarification || "Please provide the missing detail."}
                   </Typography>
-                  {item && item.docType && item.docType !== "none" ? (
+                  {item?.docType && item.docType !== "none" ? (
                     <Typography variant="caption" color="text.secondary">
                       (for: {String(item.docType).replace("_", " ")})
                     </Typography>
                   ) : null}
+                </CardContent>
+              </Card>
+            )}
+
+            {/* ERROR CARD */}
+            {kind === "error" && (
+              <Card variant="outlined" sx={{ backgroundColor: "#ffebee" }}>
+                <CardContent>
+                  {/* primary message if provided */}
+                  {item?.message ? (
+                    <Alert severity="error" sx={{ mb: 1 }}>{item.message}</Alert>
+                  ) : null}
+
+                  {/* structured errors */}
+                  {Array.isArray(item?.errors) && item.errors.length > 0 && (
+                    <Alert severity="error" sx={{ mb: 1 }}>
+                      <ul style={{ margin: 0, paddingLeft: "1.2rem" }}>
+                        {item.errors.map((e, i) => (
+                          <li key={i}>
+                            <strong>{e.code || "ERROR"}:</strong> {e.message || pretty(e)}
+                            {e.meta ? (
+                              <em style={{ marginLeft: 6 }}>
+                                {Object.entries(e.meta).map(([k, v]) => `${k}=${v}`).join(", ")}
+                              </em>
+                            ) : null}
+                          </li>
+                        ))}
+                      </ul>
+                    </Alert>
+                  )}
+
+                  {/* structured warnings */}
+                  {Array.isArray(item?.warnings) && item.warnings.length > 0 && (
+                    <Alert severity="warning">
+                      <ul style={{ margin: 0, paddingLeft: "1.2rem" }}>
+                        {item.warnings.map((w, i) => (
+                          <li key={i}>
+                            <strong>{w.code || "WARN"}:</strong> {w.message || pretty(w)}
+                          </li>
+                        ))}
+                      </ul>
+                    </Alert>
+                  )}
+                </CardContent>
+              </Card>
+            )}
+
+            {/* RAW DEBUG CARD (fallback) */}
+            {kind === "raw" && (
+              <Card variant="outlined" sx={{ backgroundColor: "#f5f5f5" }}>
+                <CardContent>
+                  <Typography variant="subtitle2" gutterBottom>Raw response (debug)</Typography>
+                  <pre style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", margin: 0 }}>
+                    {JSON.stringify(item.raw, null, 2)}
+                  </pre>
                 </CardContent>
               </Card>
             )}

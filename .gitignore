@@ -1,0 +1,5 @@
+
+# ignore binaries & env
+*.zip
+.env*
+

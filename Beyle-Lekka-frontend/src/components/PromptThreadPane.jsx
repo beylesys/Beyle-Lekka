@@ -527,6 +527,13 @@ const PromptThreadPane = () => {
                       </ul>
                     </Alert>
                   )}
+
+                  {/* optional next-step hint from server (e.g., reimbursement question) */}
+                  {item?.clarification ? (
+                    <Alert severity="info" sx={{ mt: 1 }}>
+                      {item.clarification}
+                    </Alert>
+                  ) : null}
                 </CardContent>
               </Card>
             )}

@@ -1,24 +1,22 @@
-import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
-
-const backend = 'http://localhost:3000'
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
 
 export default defineConfig({
-  plugins: [react()],
   server: {
     port: 5173,
-    strictPort: true,
+    open: false, // don't auto-open any path
     proxy: {
-      '/api': {
-        target: backend,
+      "/api": {
+        target: "http://localhost:3000",
         changeOrigin: true,
-        configure(proxy) {
-          proxy.on('proxyReq', (_proxyReq, req) => console.log('[vite →]', req.method, req.url))
-          proxy.on('proxyRes', (res, req) => console.log('[vite ←]', res.statusCode, req.method, req.url))
-        }
+        secure: false,
       },
-      '/health': { target: backend, changeOrigin: true },
-      '/files':  { target: backend, changeOrigin: true },
-    }
-  }
-})
+      "/files": {
+        target: "http://localhost:3000",
+        changeOrigin: true,
+        secure: false,
+      },
+    },
+  },
+  plugins: [react()],
+});

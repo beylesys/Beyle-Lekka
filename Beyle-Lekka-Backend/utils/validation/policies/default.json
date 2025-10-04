@@ -6,13 +6,36 @@
   "cashDoubleConfirmThreshold": 20000,
   "requireBankInstrumentDetails": true,
   "roundingMode": "HALF_UP",
+
+  "financialYear": { "startMonth": 4, "startDay": 1 },
+
   "gst": { "enabled": true, "assumeIntraIfUnknown": true },
   "inventory": { "enabled": true, "blockNegativeStock": true },
+  "cashBank": { "blockNegative": true },
+
   "tds": {
     "enabled": true,
     "applyOn": "amountExcludingGST",
     "noPanRateOverride": 0.20,
-    "rates": { "194C": 0.01, "194J": 0.10, "194H": 0.05 },
-    "requireLedger": "TDS Payable"
+    "rates": {
+      "194C": 0.01,
+      "194J": 0.10,
+      "194H": 0.05,
+      "194I": 0.10
+    },
+    "requireLedger": "TDS Payable",
+    "autoDetect": {
+      "singlePaymentThresholds": {
+        "194C": 30000,
+        "194J": 30000,
+        "194H": 15000
+      },
+      "annualAggregateThresholds": {
+        "194C": 100000,
+        "194J": 30000,
+        "194H": 15000,
+        "194I": 240000
+      }
+    }
   }
 }

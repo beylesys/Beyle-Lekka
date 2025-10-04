@@ -6,12 +6,24 @@ dotenv.config();
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Your original label set remains intact
+// Keep original label set
 const VALID_RESULTS = ["followup", "invoice", "receipt", "voucher", "new", "uncertain"];
 
 const TODAY = new Date().toISOString().slice(0, 10);
 const ORG_NAME  = (process.env.ORG_NAME  || "").toLowerCase().trim();
 const ORG_GSTIN = (process.env.ORG_GSTIN || "").toLowerCase().trim();
+
+/* -------------------- CONTRA DETECTOR -------------------- */
+const CONTRA_WITHDRAW_RE = /(withdraw|withdrew|drawn)\s+cash|cash\s*withdrawal|petty\s*cash/i;
+const CONTRA_DEPOSIT_RE  = /(deposit|deposited)\s+cash|cash\s+deposit|cash\s+to\s+bank/i;
+
+function detectContraFromText(s) {
+  const t = String(s || "").toLowerCase();
+  if (!t) return "NONE";
+  if (CONTRA_WITHDRAW_RE.test(t)) return "BANK_TO_CASH";
+  if (CONTRA_DEPOSIT_RE.test(t))  return "CASH_TO_BANK";
+  return "NONE";
+}
 
 /* -------------------- SYSTEM PROMPT -------------------- */
 const SYSTEM = `
@@ -22,8 +34,8 @@ Return ONLY JSON with:
 {
   "status": "success" | "followup_needed",
   "type": "followup|invoice|receipt|voucher|new|uncertain",
-  "flow": "payment_voucher|receipt|vendor_credit|ignore_outbound|none",
-  "doc_semantic_type": "vendor_invoice|receipt|delivery_note|own_sales_invoice|unknown",
+  "flow": "payment_voucher|receipt|vendor_credit|contra|ignore_outbound|none",
+  "doc_semantic_type": "vendor_invoice|receipt|delivery_note|contra_voucher|own_sales_invoice|unknown",
   "confidence": 0..1,
   "clarification": "...", // when followup_needed
   "signals": {
@@ -34,7 +46,8 @@ Return ONLY JSON with:
     "vendor": string,
     "received_from": string,
     "invoice_number": string,
-    "paid": boolean
+    "paid": boolean,
+    "direction": "BANK_TO_CASH|CASH_TO_BANK"
   }
 }
 
@@ -42,9 +55,11 @@ Guidance:
 - Paid vendor slips / retail tax invoices → flow:"payment_voucher"; set type:"voucher".
 - Money received by us → flow:"receipt"; type:"receipt".
 - Unpaid vendor invoice → flow:"vendor_credit"; set type:"new" (do NOT force 'invoice' here).
+- Cash ↔ Bank internal transfer (withdraw/deposit/petty-cash top-up) → flow:"contra"; type:"voucher"; doc_semantic_type:"contra_voucher".
 - Outbound (our own sales invoice) → flow:"ignore_outbound" (never 'invoice').
 - If the user just answers a prior question (short reply), type:"followup".
 - Never invent values; only include signals you can see.
+- For CONTRA: never ask for a payee/vendor/beneficiary. If anything is missing, ask only for amount/direction/bank.
 `;
 
 /* -------------------- FEW-SHOTS -------------------- */
@@ -98,6 +113,30 @@ FIELDS: {}`
         paid: true
       }
     })
+  },
+  // Contra example
+  {
+    role: "user",
+    content:
+`TEXT:
+"Withdrew cash 15,000 from bank for petty cash."
+DOC_TYPE: ""
+FIELDS: {}`
+  },
+  {
+    role: "assistant",
+    content: JSON.stringify({
+      status: "success",
+      type: "voucher",
+      flow: "contra",
+      doc_semantic_type: "contra_voucher",
+      confidence: 0.95,
+      signals: {
+        amount: 15000,
+        direction: "BANK_TO_CASH",
+        payment_mode: "CASH"
+      }
+    })
   }
 ];
 
@@ -111,13 +150,12 @@ function normalizePaymentMode(raw) {
   if (/(neft|imps|rtgs|bank|transfer|online)/i.test(s)) return "BANK";
   if (/(card|visa|master|rupay|debit|credit)/i.test(s)) return "CARD";
   if (/cash/i.test(s)) return "CASH";
-  return raw; // leave as-is if unrecognized
+  return raw;
 }
 
 function normalizeSignals(sig = {}) {
   const out = { ...sig };
 
-  // amount/date normalization
   if (typeof out.amount === "string") {
     const n = Number(String(out.amount).replace(/[^\d.-]/g, ""));
     if (Number.isFinite(n)) out.amount = n;
@@ -126,13 +164,14 @@ function normalizeSignals(sig = {}) {
     out.date = out.date.replace(/\//g, "-").slice(0, 10);
   }
 
-  // 🔐 bridge & normalize payment channel (critical for production accuracy)
   if (!out.payment_mode && out.mode) out.payment_mode = out.mode;
-  if (typeof out.payment_mode === "string") {
-    out.payment_mode = normalizePaymentMode(out.payment_mode);
-  }
-  // keep symmetric alias for downstream code that might read `mode`
+  if (typeof out.payment_mode === "string") out.payment_mode = normalizePaymentMode(out.payment_mode);
   if (!out.mode && out.payment_mode) out.mode = out.payment_mode;
+
+  if (typeof out.direction === "string") {
+    const d = out.direction.toUpperCase().replace(/\s+/g, "_");
+    if (d === "BANK_TO_CASH" || d === "CASH_TO_BANK") out.direction = d;
+  }
 
   return out;
 }
@@ -141,11 +180,13 @@ function flowToPromptType(flow) {
   switch (flow) {
     case "payment_voucher": return "payment_voucher";
     case "receipt": return "receipt";
+    case "contra": return "contra_voucher";
     default: return "none";
   }
 }
 
-export function buildCanonicalPromptFromSignals(flow, signals = {}, fallbackText = "") {
+export function buildCanonicalPromptFromSignals(flowOrDocHint, signals = {}, fallbackText = "") {
+  const flow = String(flowOrDocHint || "").toLowerCase();
   const s = normalizeSignals(signals);
   const parts = [];
 
@@ -158,7 +199,6 @@ export function buildCanonicalPromptFromSignals(flow, signals = {}, fallbackText
     if (s.date) parts.push(`on ${s.date}`);
     if (s.invoice_number) parts.push(`. Reference: vendor invoice #${s.invoice_number}`);
     parts.push(". Purpose: purchase/expense.");
-    // 👇 Nudge model away from 'Cash' unless payment_mode explicitly says CASH
     parts.push(" Use 'Bank' when payment_mode is UPI/BANK/CARD; use 'Cash' only if payment_mode is CASH.");
     return parts.join(" ").replace(/\s+\./g, ".");
   }
@@ -171,6 +211,36 @@ export function buildCanonicalPromptFromSignals(flow, signals = {}, fallbackText
     if (s.date) parts.push(`on ${s.date}`);
     parts.push(".");
     return parts.join(" ").replace(/\s+\./g, ".");
+  }
+
+  if (flow === "contra_voucher" || flow === "contra") {
+    const direction = s.direction || "BANK_TO_CASH";
+    const date = s.date || null;
+    const amount = s.amount ?? null;
+
+    return [
+      "You are an accountant generating a CONTRA (bank↔cash) entry.",
+      "Rules:",
+      " - This is an internal transfer. Do NOT include any external party/payee/vendor.",
+      " - Output exactly two lines: one Bank, one Cash, opposite sides, same amount.",
+      " - If amount or direction is missing, ask ONE concise clarification.",
+      " - Do NOT ask for payee/vendor under any circumstances.",
+      "",
+      "Return a JSON object with:",
+      " {",
+      '   "status": "success" | "followup_needed",',
+      '   "docType": "contra_voucher",',
+      '   "journal": [ {account, debit, credit, date?}, {account, debit, credit, date?} ],',
+      '   "documentFields": { "contra_voucher": { "date": "YYYY-MM-DD", "amount": number, "direction": "BANK_TO_CASH|CASH_TO_BANK" } },',
+      '   "clarification": "..." // when status = followup_needed',
+      " }",
+      "",
+      "Signals (safe to use):",
+      JSON.stringify({ direction, date, amount }),
+      "",
+      "Context (names only, ignore numbers in here):",
+      String(fallbackText || "")
+    ].join("\n");
   }
 
   if (flow === "vendor_credit") {
@@ -200,7 +270,22 @@ export const classifyPromptType = async (arg1, arg2) => {
       typeof lastItem === "string" ? lastItem : (lastItem?.clarification || "");
     const wordCount = (currentPrompt || "").trim().split(/\s+/).filter(Boolean).length;
 
-    // Build doc-aware message to keep the classifier context-rich
+    // ---- Fast path: clear contra language → short-circuit as CONTRA
+    const contraIntent = detectContraFromText(currentPrompt || "");
+    if (contraIntent !== "NONE") {
+      return {
+        status: "success",
+        type: "voucher",
+        flow: "contra",
+        docSemanticType: "contra_voucher",
+        promptType: "contra_voucher",
+        signals: normalizeSignals({ direction: contraIntent }),
+        confidence: 0.98,
+        clarification: ""
+      };
+    }
+
+    // Build doc-aware message
     const userBlob = `
 TEXT:
 ${currentPrompt ? JSON.stringify(currentPrompt) : '""'}
@@ -249,8 +334,8 @@ ${lastClarification ? `\nEARLIER_CLARIFICATION:\n${JSON.stringify(lastClarificat
             properties: {
               status: { type: "string", enum: ["success","followup_needed"] },
               type:   { type: "string", enum: VALID_RESULTS },
-              flow:   { type: "string", enum: ["payment_voucher","receipt","vendor_credit","ignore_outbound","none"] },
-              doc_semantic_type: { type: "string", enum: ["vendor_invoice","receipt","delivery_note","own_sales_invoice","unknown"] },
+              flow:   { type: "string", enum: ["payment_voucher","receipt","vendor_credit","contra","ignore_outbound","none"] },
+              doc_semantic_type: { type: "string", enum: ["vendor_invoice","receipt","delivery_note","contra_voucher","own_sales_invoice","unknown"] },
               confidence: { type: "number", minimum: 0, maximum: 1 },
               clarification: { type: "string" },
               signals: {
@@ -264,7 +349,8 @@ ${lastClarification ? `\nEARLIER_CLARIFICATION:\n${JSON.stringify(lastClarificat
                   vendor: { type: "string" },
                   received_from: { type: "string" },
                   invoice_number: { type: "string" },
-                  paid: { type: "boolean" }
+                  paid: { type: "boolean" },
+                  direction: { type: "string", enum: ["BANK_TO_CASH","CASH_TO_BANK"] }
                 }
               }
             }
@@ -307,6 +393,20 @@ ${lastClarification ? `\nEARLIER_CLARIFICATION:\n${JSON.stringify(lastClarificat
       let flow = "none";
       let doc  = "unknown";
 
+      // Heuristic contra check (second chance)
+      const hContra = detectContraFromText(txt);
+      if (hContra !== "NONE") {
+        return {
+          type: "voucher",
+          promptType: "contra_voucher",
+          flow: "contra",
+          docSemanticType: "contra_voucher",
+          signals: normalizeSignals({ direction: hContra }),
+          confidence: 0.7,
+          clarification: ""
+        };
+      }
+
       if (parsedDocType) {
         const d = parsedDocType.toLowerCase();
         if (d.includes("receipt")) { type = "receipt"; flow = "receipt"; doc = "receipt"; }
@@ -337,13 +437,11 @@ ${lastClarification ? `\nEARLIER_CLARIFICATION:\n${JSON.stringify(lastClarificat
     const signals = normalizeSignals(candidate.signals || {});
     const confidence = Number.isFinite(candidate.confidence) ? candidate.confidence : 0;
 
-    // Outbound docs never proceed in this inbound pipeline
     if (docSemanticType === "own_sales_invoice") {
       flow = "ignore_outbound";
       type = "uncertain";
     }
 
-    // Ensure type conforms to your enum (map from flow if needed)
     if (!VALID_RESULTS.includes(type)) {
       type = flow === "payment_voucher" ? "voucher"
            : flow === "receipt"         ? "receipt"
@@ -351,16 +449,16 @@ ${lastClarification ? `\nEARLIER_CLARIFICATION:\n${JSON.stringify(lastClarificat
            : (status === "followup_needed" ? "followup" : "uncertain");
     }
 
-    // Short-reply override: preserve the original follow-up behavior
+    // Use the earlier wordCount; do NOT redeclare it here
     const shortReply = (type === "uncertain" && wordCount <= 10 && lastClarification);
     if (shortReply) type = "followup";
 
     return {
-      type,                                   // (unchanged) NL-JE label
-      promptType: flowToPromptType(flow),     // downstream accountant prompt type
+      type,
+      promptType: flowToPromptType(flow),
       flow,
       docSemanticType,
-      signals,                                // includes normalized payment_mode/mode
+      signals,
       confidence,
       clarification: candidate.clarification || ""
     };

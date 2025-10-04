@@ -1,5 +1,4 @@
-// src/context/PromptContext.js
-import React, { createContext, useContext, useState } from "react";
+import React, { createContext, useContext, useEffect, useState } from "react";
 
 const PromptContext = createContext();
 
@@ -25,11 +24,27 @@ const normalizeDocFields = (docType, documentFields) => {
 };
 
 export const PromptProvider = ({ children }) => {
-  const [sessionId] = useState(() => `S-${Date.now()}`);
+  // Persist and reuse a stable workspace id so Reports/GETs hit the same tenant as POSTs
+  const initialSid = (() => {
+    try {
+      return localStorage.getItem("workspaceId") || "default-session";
+    } catch {
+      return "default-session";
+    }
+  })();
+
+  const [sessionId, setSessionId] = useState(initialSid);
   const [prompt, setPrompt] = useState("");
   const [status, setStatus] = useState("idle"); // 'idle' | 'preview' | 'followup' | 'error'
   const [thread, setThread] = useState([]);
   const [lastResponseType, setLastResponseType] = useState(null);
+
+  // Keep localStorage in sync so the axios request interceptor can read it
+  useEffect(() => {
+    try {
+      localStorage.setItem("workspaceId", sessionId);
+    } catch {}
+  }, [sessionId]);
 
   /**
    * Accepts:
@@ -96,15 +111,26 @@ export const PromptProvider = ({ children }) => {
 
     // ---------- INVALID / BACKEND ERROR ----------
     if (rawStatus === "invalid" || rawStatus === "error" || data?.success === false) {
+      // Properly format structured error objects to avoid "[object Object]"
+      const formattedErrors = Array.isArray(data?.errors)
+        ? data.errors.map((e) =>
+            e && typeof e === "object"
+              ? [e.code, e.message].filter(Boolean).join(": ") || JSON.stringify(e)
+              : String(e)
+          )
+        : null;
+
       const msg =
         data?.error ||
-        (Array.isArray(data?.errors) && data.errors.join(", ")) ||
+        (formattedErrors && formattedErrors.join(" · ")) ||
         "Something went wrong. Please try again.";
+
       const entry = {
         kind: "error",
         message: msg,
-        errors: data?.errors || [],
-        warnings: data?.warnings || [],
+        errors: Array.isArray(data?.errors) ? data.errors : [],
+        warnings: Array.isArray(data?.warnings) ? data.warnings : [],
+        clarification: data?.clarification || null, // <-- surface server next-step hint
         raw: data,
       };
       setThread((prev) => [...prev, entry]);
@@ -141,7 +167,6 @@ export const PromptProvider = ({ children }) => {
     }
 
     // ---------- FALLBACK ----------
-    // If we still received a journal-like array, try to render a preview anyway.
     if (journal.length >= 1) {
       const entry = {
         kind: "preview",
@@ -162,8 +187,6 @@ export const PromptProvider = ({ children }) => {
       return;
     }
 
-    // Nothing matched → push a raw entry so UI can optionally show it (debug),
-    // but mark state as error so callers know it didn't fit known shapes.
     console.warn("⚠️ Unrecognized response shape, storing raw and entering error state:", data);
     setThread((prev) => [...prev, { kind: "raw", raw: data }]);
     setStatus("error");
@@ -182,7 +205,8 @@ export const PromptProvider = ({ children }) => {
   return (
     <PromptContext.Provider
       value={{
-        sessionId,
+        sessionId,            // current workspace/tenant id
+        setSessionId,         // (optional) expose setter for a switcher later
         prompt,
         setPrompt,
         status,

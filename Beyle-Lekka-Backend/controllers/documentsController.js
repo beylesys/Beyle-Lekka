@@ -5,6 +5,7 @@
 // Items: Tabula (deterministic) → scales to thousands of rows.
 // Guardrails: totals vs sum(items).
 // Degrades gracefully if Tabula/Java missing.
+// Multi-tenant ready: allows admin "ALL" scope (req.sessionId === null). No DB writes here.
 
 import multer from "multer";
 import path from "path";
@@ -24,6 +25,15 @@ export const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 50 * 1024 * 1024 } // 50 MB for very large PDFs
 });
+
+// ---------- Admin/dev gate for sensitive debug (rawText) ----------
+function isAdminRequest(req) {
+  const key = req.headers?.["x-admin-key"];
+  const devKey = process.env.DEV_ADMIN_KEY;
+  const devAllowed = process.env.NODE_ENV !== "production" && devKey && key === devKey;
+  const jwtAllowed = !!(req.user && Array.isArray(req.user.roles) && req.user.roles.includes("superadmin"));
+  return devAllowed || jwtAllowed;
+}
 
 // ---------- Org identity (optional) ----------
 const ORG_NAME = (process.env.ORG_NAME || "").toLowerCase().trim();
@@ -167,9 +177,19 @@ function sanitizeClassification(cls) {
   return out;
 }
 
+function normalizeSnippet(s, n = 180) {
+  return String(s || "").replace(/\s+/g, " ").trim().slice(0, n);
+}
+
 // ---------- Text-only parse (for test tools) ----------
 export async function parseDocument(req, res) {
   try {
+    // Tenant: allow admin "ALL" scope because there are no writes here.
+    if (typeof req.sessionId === "undefined") {
+      return res.status(500).json({ ok: false, error: "Tenant middleware not initialized." });
+    }
+    const sid = req.sessionId ?? null;
+
     const { text = "", fileName = "" } = req.body || {};
     const content = String(text || "");
 
@@ -185,6 +205,7 @@ export async function parseDocument(req, res) {
         docType: guess || "unknown",
         fields: {},
         rawTextLength: content.length,
+        meta: { workspaceId: sid, fileName },
         reason: "LLM uncertain for the provided text."
       });
     }
@@ -196,12 +217,12 @@ export async function parseDocument(req, res) {
         docType: "own_sales_invoice",
         fields: fieldsRes.fields || {},
         rawTextLength: content.length,
-        reason: "Appears to be issued by your own business; inbound docs only.",
-        meta: fieldsRes.meta
+        meta: { ...(fieldsRes.meta || {}), workspaceId: sid, fileName },
+        reason: "Appears to be issued by your own business; inbound docs only."
       });
     }
 
-    // Optionally classify here as well for parity
+    // Optional classification for parity
     let docType = fieldsRes.docType || "unknown";
     let classification = null;
     try {
@@ -214,7 +235,7 @@ export async function parseDocument(req, res) {
       const sem = classification?.docSemanticType || classification?.semanticType || classification?.type;
       if (sem && typeof sem === "string") docType = sem;
     } catch (e) {
-      // keep heuristic docType; classification optional in this endpoint
+      // classification optional here
     }
 
     return res.json({
@@ -223,7 +244,8 @@ export async function parseDocument(req, res) {
       classification: sanitizeClassification(classification),
       fields: fieldsRes.fields || {},
       rawTextLength: content.length,
-      meta: fieldsRes.meta
+      meta: { ...(fieldsRes.meta || {}), workspaceId: sid, fileName },
+      snippet: normalizeSnippet(content)
     });
   } catch (err) {
     console.error(err);
@@ -234,13 +256,25 @@ export async function parseDocument(req, res) {
 // ---------- Upload & Extract ----------
 export const uploadAndExtract = async (req, res) => {
   try {
+    // Tenant: allow admin "ALL" scope because there are no writes here.
+    if (typeof req.sessionId === "undefined") {
+      return res.status(500).json({ ok: false, error: "Tenant middleware not initialized." });
+    }
+    const sid = req.sessionId ?? null;
+
     const file = req.file || null;
     const incomingText = req.body?.text || "";
     const fileName = file?.originalname || req.body?.fileName || "";
     const extractionId = randomUUID();
 
-    // developer-controlled debug gate (rawText only if debug=1)
-    const debug = String(req.query?.debug || req.body?.debug || "0") === "1";
+    // Require either file or text
+    if (!file && !incomingText) {
+      return res.status(400).json({ ok: false, error: "file or text is required" });
+    }
+
+    // developer-controlled debug gate (rawText only if explicitly requested AND admin/dev allowed)
+    const debugRequested = String(req.query?.debug || req.body?.debug || "0") === "1";
+    const debugAllowed = debugRequested && isAdminRequest(req);
 
     // 1) Get raw text (pdf-parse → OCR fallback)
     const rawText = await extractTextFromUpload(file, incomingText);
@@ -259,8 +293,8 @@ export const uploadAndExtract = async (req, res) => {
         extractionId,
         docType: "own_sales_invoice",
         fields: {},
-        ...(debug ? { rawText } : {}), // ← rawText only in debug mode
-        meta: { direction: "outbound" },
+        ...(debugAllowed ? { rawText } : {}), // rawText only in authorized debug
+        meta: { direction: "outbound", workspaceId: sid, fileName },
         reason: "Appears issued by your own business; inbound docs only."
       });
     }
@@ -334,14 +368,18 @@ export const uploadAndExtract = async (req, res) => {
         extractionId,
         docType,
         fields,
-        ...(debug ? { rawText } : {}), // ← rawText only in debug mode
+        ...(debugAllowed ? { rawText } : {}), // rawText only in authorized debug
         meta: {
           ...(fieldsRes.meta || {}),
           items_confidence: itemsMeta.confidence,
           picked: itemsMeta.picked,
-          guardWarnings
+          guardWarnings,
+          workspaceId: sid,
+          fileName
         },
-        reason: "Appears to be issued by your own business; inbound docs only."
+        reason: "Appears to be issued by your own business; inbound docs only.",
+        snippet: normalizeSnippet(rawText),
+        rawTextLength
       });
     }
 
@@ -364,7 +402,7 @@ export const uploadAndExtract = async (req, res) => {
       console.warn("classifyPromptType (upload) failed:", e?.message || e);
     }
 
-    // 7) Final payload for UI/orchestrator (NO rawText unless debug=1)
+    // 7) Final payload for UI/orchestrator (NO rawText unless authorized debug)
     return res.status(200).json({
       ok: true,
       fileId: extractionId,
@@ -372,14 +410,16 @@ export const uploadAndExtract = async (req, res) => {
       docType: docType || "unknown",
       classification: sanitizeClassification(classification),
       fields: mergedFields,
-      ...(debug ? { rawText } : {}), // ← rawText only in debug mode
+      ...(debugAllowed ? { rawText } : {}), // rawText only in authorized debug
       meta: {
         ...(fieldsRes.meta || {}),
         items_confidence: itemsMeta.confidence,
         picked: itemsMeta.picked,
-        guardWarnings
+        guardWarnings,
+        workspaceId: sid,
+        fileName
       },
-      snippet: (rawText || "").slice(0, 180),
+      snippet: normalizeSnippet(rawText),
       rawTextLength
     });
   } catch (err) {

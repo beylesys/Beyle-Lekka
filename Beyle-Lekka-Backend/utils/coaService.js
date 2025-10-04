@@ -1,6 +1,6 @@
-﻿// utils/coaService.js (enhanced to eradicate duplicate ledger names at the source)
-// Grounded in your repo; keeps schema/seed logic but adds canonicalization and
-// a startup sweep to normalize legacy ledger names stored in `ledger_entries`.
+﻿// utils/coaService.js
+// Enhanced: multi-tenant aware (session_id), Postgres-ready column detection,
+// preserves existing functionality (canonicalization, seeding, dedupe, parent-child creation).
 
 import { query } from "../services/db.js";
 
@@ -101,22 +101,72 @@ const BASE_COA = [
   ["7110", "TDS Payable (194J)", "liability", "credit"],
 ];
 
-/* ----------------- helpers ----------------- */
+/* ----------------- detection helpers (SQLite now; PG-ready later) ----------------- */
+
+function safeIdent(t) {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(String(t || ""))) throw new Error(`Invalid identifier: ${t}`);
+  return t;
+}
+
+async function pragmaTableInfo(table) {
+  // Postgres path
+  try {
+    const r = await query(
+      `SELECT lower(column_name) AS name
+         FROM information_schema.columns
+        WHERE lower(table_name) = lower($1)`,
+      [table]
+    );
+    if (Array.isArray(r.rows)) return r.rows.map(x => x.name);
+  } catch {}
+  // SQLite PRAGMA (cannot bind identifiers)
+  try {
+    const t = safeIdent(table);
+    const r = await query(`PRAGMA table_info(${t})`);
+    if (Array.isArray(r.rows)) return r.rows.map(x => String(x.name || x.NAME).toLowerCase());
+  } catch {}
+  return [];
+}
+
+async function tableHasColumn(table, col) {
+  const cols = await pragmaTableInfo(table);
+  return cols.includes(String(col).toLowerCase());
+}
+
+async function detectCoaCols() {
+  const names = await pragmaTableInfo("chart_of_accounts");
+  return {
+    hasSessionId:     names.includes("session_id"),
+    hasAccountCode:   names.includes("account_code"),
+    hasType:          names.includes("type"),
+    hasNormalBalance: names.includes("normal_balance"),
+    hasIsActive:      names.includes("is_active"),
+    hasParentCode:    names.includes("parent_code"),
+  };
+}
+
+async function detectLedgerCols() {
+  const names = await pragmaTableInfo("ledger_entries");
+  return {
+    hasSessionId: names.includes("session_id"),
+    hasDebit:     names.includes("debit_account"),
+    hasCredit:    names.includes("credit_account"),
+  };
+}
+
+/* ----------------- normalization helpers ----------------- */
 
 function normalizeDashes(s = "") {
   // Replace figure dash, en dash, em dash, minus → hyphen
   return String(s).replace(/[\u2012\u2013\u2014\u2212]/g, "-");
 }
-
 function normalizeSpaces(s = "") {
   return String(s).replace(/\s+/g, " ").trim();
 }
-
 function normKey(s = "") {
   // Lowercase + normalized dashes/spaces for comparisons
   return normalizeSpaces(normalizeDashes(s)).toLowerCase();
 }
-
 function namesEqual(a = "", b = "") {
   return normKey(a) === normKey(b);
 }
@@ -130,7 +180,10 @@ function splitSub(name) {
   return null;
 }
 
+/* ----------------- codes ----------------- */
+
 async function codeExists(code) {
+  // account_code is global PK in your schema; keep behavior
   const { rows } = await query(
     "SELECT 1 FROM chart_of_accounts WHERE account_code = $1 LIMIT 1",
     [code]
@@ -147,14 +200,8 @@ async function nextFreeCode(maxTries = 50) {
   return String((Date.now() % 100000) + 10000);
 }
 
-/* ---------- Canonicalization ---------- */
+/* ---------- Canonicalization (pure) ---------- */
 
-/**
- * Canonicalize a ledger name (pure, no DB lookups).
- * - Normalizes whitespace & dashes.
- * - Maps common synonyms to the canonical names used in BASE_COA.
- * - Standardizes A/R & A/P parent labels.
- */
 function canonicalizeLedgerName(raw = "") {
   let n0 = normalizeSpaces(normalizeDashes(raw));
   if (!n0) return n0;
@@ -169,22 +216,19 @@ function canonicalizeLedgerName(raw = "") {
     return "Cash";
   }
 
-  // GST Input (IGST/CGST/SGST)
-  // Handles: "Input SGST", "SGST Input", "SGST Input Credit Account", "IGST ITC", etc.
+  // GST Input / Output (IGST/CGST/SGST)
   const tax = /(i|c|s)gst/.exec(low)?.[1];
   if (tax) {
     const slab = tax === "i" ? "IGST" : tax === "c" ? "CGST" : "SGST";
-    if (/\b(input|itc)\b/.test(low)) return `GST Input (${slab})`;
+    if (/\b(input|itc)\b/.test(low))  return `GST Input (${slab})`;
     if (/\b(output|out)\b/.test(low)) return `GST Output (${slab})`;
-    // "GST Payable" we leave as-is because BASE_COA explicitly has those ledgers too.
   }
 
-  // A/R and A/P standardized parent labels when they are explicitly present
-  // Any "Accounts Receivable - X" / "Debtors - X" → "Debtors (Accounts Receivable) - X"
+  // A/R standardized
   let m = low.match(/^(accounts\s*receivable|debtors)(?:\s*\(accounts\s*receivable\))?\s*[-:]\s*(.+)$/i);
   if (m) return `Debtors (Accounts Receivable) - ${normalizeSpaces(m[2])}`;
 
-  // Any "Accounts Payable - X" / "Creditors - X" → "Creditors (Accounts Payable) - X"
+  // A/P standardized
   m = low.match(/^(accounts\s*payable|creditors)(?:\s*\(accounts\s*payable\))?\s*[-:]\s*(.+)$/i);
   if (m) return `Creditors (Accounts Payable) - ${normalizeSpaces(m[2])}`;
 
@@ -194,9 +238,9 @@ function canonicalizeLedgerName(raw = "") {
 /**
  * Resolve to a canonical name with DB-assisted disambiguation for party ledgers.
  * If raw is a bare party name like "Mr X" and a canonical AR/AP sub-ledger already
- * exists for it, reuse that to avoid duplicates. Otherwise, return the pure canonical name.
+ * exists for it (in-scope for tenant when session_id is present), reuse it.
  */
-async function resolveCanonicalName(raw = "") {
+async function resolveCanonicalName(raw = "", sid = null) {
   const pure = canonicalizeLedgerName(raw);
   if (!pure) return pure;
 
@@ -206,65 +250,133 @@ async function resolveCanonicalName(raw = "") {
     /\b(debtors|accounts receivable|creditors|accounts payable)\b/i.test(pure);
   if (hasDash && containsARAP) return pure;
 
-  // Bare party names: if AR/AP sub-ledgers already exist, reuse them.
-  // Prefer Accounts Receivable if both exist (conservative).
   const party = pure;
-  // Check AR
-  let rows = await query(
-    "SELECT name FROM chart_of_accounts WHERE LOWER(name) = LOWER($1) LIMIT 1",
-    [`Debtors (Accounts Receivable) - ${party}`]
-  );
-  if (rows.rows?.length) return `Debtors (Accounts Receivable) - ${party}`;
-  // Check AP
-  rows = await query(
-    "SELECT name FROM chart_of_accounts WHERE LOWER(name) = LOWER($1) LIMIT 1",
-    [`Creditors (Accounts Payable) - ${party}`]
-  );
-  if (rows.rows?.length) return `Creditors (Accounts Payable) - ${party}`;
+  // Prefer Accounts Receivable if both exist (conservative).
+  // AR
+  if (sid && (await tableHasColumn("chart_of_accounts", "session_id"))) {
+    let r = await query(
+      `SELECT name FROM chart_of_accounts WHERE session_id = $1 AND LOWER(name) = LOWER($2) LIMIT 1`,
+      [sid, `Debtors (Accounts Receivable) - ${party}`]
+    );
+    if (r.rows?.length) return `Debtors (Accounts Receivable) - ${party}`;
+    r = await query(
+      `SELECT name FROM chart_of_accounts WHERE session_id = $1 AND LOWER(name) = LOWER($2) LIMIT 1`,
+      [sid, `Creditors (Accounts Payable) - ${party}`]
+    );
+    if (r.rows?.length) return `Creditors (Accounts Payable) - ${party}`;
+  } else {
+    let r = await query(
+      `SELECT name FROM chart_of_accounts WHERE LOWER(name) = LOWER($1) LIMIT 1`,
+      [`Debtors (Accounts Receivable) - ${party}`]
+    );
+    if (r.rows?.length) return `Debtors (Accounts Receivable) - ${party}`;
+    r = await query(
+      `SELECT name FROM chart_of_accounts WHERE LOWER(name) = LOWER($1) LIMIT 1`,
+      [`Creditors (Accounts Payable) - ${party}`]
+    );
+    if (r.rows?.length) return `Creditors (Accounts Payable) - ${party}`;
+  }
 
   return pure;
 }
 
-/**
- * Lookup a ledger by "normalized name" equality (case/space/dash-insensitive).
- * Falls back to exact name if normalized scan does not find a match.
- */
-async function lookupByNormalizedName(name) {
-  const { rows } = await query(
-    "SELECT account_code, name FROM chart_of_accounts WHERE is_active = 1"
-  );
+/* ---------- Lookup (tenant-aware with GLOBAL fallback) ---------- */
+
+async function lookupByNormalizedName(name, sid = null) {
+  const hasSid = await tableHasColumn("chart_of_accounts", "session_id");
   const key = normKey(name);
+
+  if (hasSid) {
+    if (sid) {
+      // Prefer tenant; fallback to GLOBAL in a single ordered query
+      const q = await query(
+        `SELECT account_code, name, session_id
+           FROM chart_of_accounts
+          WHERE (session_id = $1 OR session_id = 'GLOBAL')
+            AND (is_active = 1 OR is_active IS NULL)
+            AND LOWER(name) = LOWER($2)
+          ORDER BY CASE WHEN session_id = $1 THEN 0 ELSE 1 END
+          LIMIT 1`,
+        [sid, name]
+      );
+      const row = (q.rows || [])[0];
+      if (row) return row;
+
+      // As a last resort, scan (handles minor whitespace/dash diffs)
+      const scan = await query(
+        `SELECT account_code, name, session_id
+           FROM chart_of_accounts
+          WHERE (session_id = $1 OR session_id = 'GLOBAL')
+            AND (is_active = 1 OR is_active IS NULL)`,
+        [sid]
+      );
+      for (const r of scan.rows || []) {
+        if (normKey(r.name) === key) return r;
+      }
+      return null;
+    }
+
+    // No SID provided but sessionized table => admin/ALL scope should only look at GLOBAL
+    const q = await query(
+      `SELECT account_code, name
+         FROM chart_of_accounts
+        WHERE session_id = 'GLOBAL' AND (is_active = 1 OR is_active IS NULL) AND LOWER(name) = LOWER($1)
+        LIMIT 1`,
+      [name]
+    );
+    if (q.rows?.length) return q.rows[0];
+
+    const scan = await query(
+      `SELECT account_code, name
+         FROM chart_of_accounts
+        WHERE session_id = 'GLOBAL' AND (is_active = 1 OR is_active IS NULL)`
+    );
+    for (const r of scan.rows || []) {
+      if (normKey(r.name) === key) return r;
+    }
+    return null;
+  }
+
+  // Legacy (no session_id column): search globally
+  const q = await query(
+    `SELECT account_code, name
+       FROM chart_of_accounts
+      WHERE (is_active = 1 OR is_active IS NULL)
+        AND LOWER(name) = LOWER($1)
+      LIMIT 1`,
+    [name]
+  );
+  if (q.rows?.length) return q.rows[0];
+
+  const { rows } = await query(
+    `SELECT account_code, name
+       FROM chart_of_accounts
+      WHERE (is_active = 1 OR is_active IS NULL)`
+  );
   for (const r of rows || []) {
     if (normKey(r.name) === key) return r;
   }
-  // Fallback exact
-  const ex = await query(
-    "SELECT account_code, name FROM chart_of_accounts WHERE name = $1 AND is_active = 1 LIMIT 1",
-    [name]
-  );
-  return (ex.rows || [])[0] || null;
+  return null;
 }
 
 /* ----------------- schema padding & seed ----------------- */
 
 export async function ensureBaseCoA() {
-  // Create table if missing (with parent_code in definition)
+  // Create table if missing (keep your legacy definition; add parent_code if needed)
   await query(`
     CREATE TABLE IF NOT EXISTS chart_of_accounts (
       account_code   TEXT PRIMARY KEY,
       name           TEXT NOT NULL UNIQUE,
       type           TEXT NOT NULL,
       normal_balance TEXT NOT NULL CHECK (normal_balance IN ('debit','credit')),
-      is_active      INTEGER NOT NULL DEFAULT 1,
-      parent_code    TEXT NULL
+      is_active      INTEGER NOT NULL DEFAULT 1
     )
   `);
 
   // Add parent_code if legacy table didn't have it
   try {
-    const info = await query(`PRAGMA table_info('chart_of_accounts')`);
-    const cols = info.rows || info;
-    if (!Array.isArray(cols) || !cols.some(c => c.name === "parent_code")) {
+    const cols = await pragmaTableInfo("chart_of_accounts");
+    if (!cols.includes("parent_code")) {
       await query(`ALTER TABLE chart_of_accounts ADD COLUMN parent_code TEXT`);
       console.log("✅ Added missing column 'parent_code' to chart_of_accounts");
     }
@@ -272,7 +384,11 @@ export async function ensureBaseCoA() {
     console.warn("⚠️ Could not ensure 'parent_code' column:", e?.message || e);
   }
 
-  // --- Deduplicate legacy data so we can build UNIQUE indexes safely ---
+  // If session_id already exists (post-migration), we keep seeding GLOBAL scope
+  const hasSid = await tableHasColumn("chart_of_accounts", "session_id");
+
+  // --- Deduplicate legacy data so unique indexes (or future constraints) are safe ---
+  // These steps are best-effort and wrapped in try/catch for cross-dialect safety.
 
   // 1) Fix duplicate account_code values (keep first, reassign others)
   try {
@@ -338,54 +454,77 @@ export async function ensureBaseCoA() {
     console.warn("⚠️ Could not dedupe duplicate names:", e?.message || e);
   }
 
-  // 3) Ensure unique indexes so ON CONFLICT works (legacy DBs may lack them)
+  // 3) Ensure helpful indexes (keep current semantics; uniqueness handled by schema)
   try {
-    await query(`CREATE UNIQUE INDEX IF NOT EXISTS ux_coa_code ON chart_of_accounts(account_code)`);
-    await query(`CREATE UNIQUE INDEX IF NOT EXISTS ux_coa_name ON chart_of_accounts(name)`);
+    await query(`CREATE INDEX IF NOT EXISTS ix_coa_name ON chart_of_accounts(name)`);
+    await query(`CREATE INDEX IF NOT EXISTS ix_coa_code ON chart_of_accounts(account_code)`);
+    if (hasSid) {
+      await query(`CREATE INDEX IF NOT EXISTS ix_coa_sid_name ON chart_of_accounts(session_id, name)`);
+      await query(`CREATE INDEX IF NOT EXISTS ix_coa_sid_code ON chart_of_accounts(session_id, account_code)`);
+    }
   } catch (e) {
-    console.warn("⚠️ Could not ensure unique indexes on chart_of_accounts:", e?.message || e);
+    console.warn("⚠️ Could not ensure indexes on chart_of_accounts:", e?.message || e);
   }
 
-  // 4) Seed baseline rows — safer with INSERT OR IGNORE (handles code or name uniqueness)
+  // 4) Seed baseline rows — insert as global rows if session_id exists, else as legacy rows
   for (const [code, name, type, normal] of BASE_COA) {
-    await query(
-      `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active)
-       VALUES ($1,$2,$3,$4,1)`,
-      [code, name, type, normal]
-    );
+    if (hasSid) {
+      await query(
+        `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, session_id)
+         VALUES ($1,$2,$3,$4,1,'GLOBAL')`,
+        [code, name, type, normal]
+      );
+    } else {
+      await query(
+        `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active)
+         VALUES ($1,$2,$3,$4,1)`,
+        [code, name, type, normal]
+      );
+    }
   }
 
-  // 5) One-time canonicalization sweep for legacy names in ledger_entries
+  // 5) Canonicalization sweep (now per-tenant if session_id exists)
   await canonicalizeExistingData();
 }
 
 /* ----------------- runtime creation / lookup ----------------- */
 
-/** Create/find a ledger by name or code. Also handles "Parent – Child" creation. */
-export async function ensureLedgerExists(nameOrCode, hint = {}) {
+export async function ensureLedgerExists(nameOrCode, sidOrHint = undefined, maybeHint = undefined) {
   const nameRaw = String(nameOrCode || "").trim();
   if (!nameRaw) return;
 
-  // First canonicalize (with DB disambiguation for party names)
-  const nameCanon = await resolveCanonicalName(nameRaw);
+  // Parse args for backward compatibility
+  let sid = null;
+  let hint = {};
+  if (typeof sidOrHint === "string") {
+    sid = sidOrHint;
+    hint = (maybeHint && typeof maybeHint === "object") ? maybeHint : {};
+  } else if (sidOrHint && typeof sidOrHint === "object") {
+    sid = sidOrHint.sid || sidOrHint.sessionId || sidOrHint.workspaceId || null;
+    hint = sidOrHint;
+  }
 
-  // 1) Match by code OR normalized name
+  const hasSidCol = await tableHasColumn("chart_of_accounts", "session_id");
+
+  // Canonicalize (w/ tenant aware reuse for AR/AP sub-ledgers)
+  const nameCanon = await resolveCanonicalName(nameRaw, hasSidCol ? sid : null);
+
+  // 1) Code match first (global PK)
   try {
-    // Code match
     const codeHit = await query(
-      "SELECT account_code FROM chart_of_accounts WHERE account_code = $1 AND is_active = 1 LIMIT 1",
+      "SELECT account_code FROM chart_of_accounts WHERE account_code = $1 AND (is_active = 1 OR is_active IS NULL) LIMIT 1",
       [nameCanon]
     );
     if (codeHit.rows?.length) return codeHit.rows[0].account_code;
-
-    // Name match (normalized)
-    const found = await lookupByNormalizedName(nameCanon);
-    if (found) return found.account_code;
   } catch {
     // table may not exist yet; continue
   }
 
-  // 2) Parent – Child creation (standardize parent labels too)
+  // 2) Name match (tenant-first with GLOBAL fallback)
+  const found = await lookupByNormalizedName(nameCanon, hasSidCol ? sid : null);
+  if (found) return found.account_code;
+
+  // 3) Parent – Child creation (standardize parent labels too)
   const parts = splitSub(nameCanon);
   if (parts) {
     let parent = parts.parent;
@@ -398,34 +537,63 @@ export async function ensureLedgerExists(nameOrCode, hint = {}) {
       parent = "Creditors (Accounts Payable)";
     }
 
-    // Find (or create) the parent first
-    let p = await lookupByNormalizedName(parent);
+    // Find (or create) the parent first (tenant-aware)
+    let p = await lookupByNormalizedName(parent, hasSidCol ? sid : null);
     if (!p) {
-      // create parent by looking up any matching base row or inferring type/normal
-      const type = /receivable/i.test(parent) ? "asset" : /payable/i.test(parent) ? "liability" : (hint.type || "asset");
+      const type   = /receivable/i.test(parent) ? "asset" : /payable/i.test(parent) ? "liability" : (hint.type || "asset");
       const normal = type === "asset" ? "debit" : "credit";
-      const pcode = await nextFreeCode();
-      await query(
-        `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, parent_code)
-         VALUES ($1,$2,$3,$4,1,NULL)`,
-        [pcode, parent, type, normal]
-      );
-      p = await lookupByNormalizedName(parent);
+      const pcode  = await nextFreeCode();
+
+      if (hasSidCol && sid) {
+        await query(
+          `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, parent_code, session_id)
+           VALUES ($1,$2,$3,$4,1,NULL,$5)`,
+          [pcode, parent, type, normal, sid]
+        );
+      } else if (hasSidCol && !sid) {
+        // if session_id col exists but no sid provided, seed into GLOBAL scope
+        await query(
+          `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, parent_code, session_id)
+           VALUES ($1,$2,$3,$4,1,NULL,'GLOBAL')`,
+          [pcode, parent, type, normal]
+        );
+      } else {
+        await query(
+          `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, parent_code)
+           VALUES ($1,$2,$3,$4,1,NULL)`,
+          [pcode, parent, type, normal]
+        );
+      }
+      p = await lookupByNormalizedName(parent, hasSidCol ? sid : null);
     }
 
     const code = await nextFreeCode();
     const fullName = `${p.name} - ${child}`;
-    await query(
-      `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, parent_code)
-       VALUES ($1,$2,$3,$4,1,$5)`,
-      [code, fullName, p.type || "asset", p.normal_balance || (p.type === "asset" ? "debit" : "credit"), p.account_code]
-    );
+    if (hasSidCol && sid) {
+      await query(
+        `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, parent_code, session_id)
+         VALUES ($1,$2,$3,$4,1,$5,$6)`,
+        [code, fullName, p.type || "asset", p.normal_balance || (p.type === "asset" ? "debit" : "credit"), p.account_code, sid]
+      );
+    } else if (hasSidCol && !sid) {
+      await query(
+        `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, parent_code, session_id)
+         VALUES ($1,$2,$3,$4,1,$5,'GLOBAL')`,
+        [code, fullName, p.type || "asset", p.normal_balance || (p.type === "asset" ? "debit" : "credit"), p.account_code]
+      );
+    } else {
+      await query(
+        `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, parent_code)
+         VALUES ($1,$2,$3,$4,1,$5)`,
+        [code, fullName, p.type || "asset", p.normal_balance || (p.type === "asset" ? "debit" : "credit"), p.account_code]
+      );
+    }
 
-    const check = await lookupByNormalizedName(fullName);
+    const check = await lookupByNormalizedName(fullName, hasSidCol ? sid : null);
     return check?.account_code || code;
   }
 
-  // 3) Heuristic: infer type when unknown (keeps UX smooth)
+  // 4) Heuristic: infer type when unknown (keeps UX smooth)
   const lower = nameCanon.toLowerCase();
   let type =
     hint.type ||
@@ -442,33 +610,94 @@ export async function ensureLedgerExists(nameOrCode, hint = {}) {
   if (typeof hint.debit === "boolean") normal = hint.debit ? "debit" : "credit";
 
   const code = await nextFreeCode();
-  await query(
-    `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active)
-     VALUES ($1,$2,$3,$4,1)`,
-    [code, nameCanon, type, normal]
-  );
-  const check = await lookupByNormalizedName(nameCanon);
+  if (hasSidCol && sid) {
+    await query(
+      `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, session_id)
+       VALUES ($1,$2,$3,$4,1,$5)`,
+      [code, nameCanon, type, normal, sid]
+    );
+  } else if (hasSidCol && !sid) {
+    await query(
+      `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, session_id)
+       VALUES ($1,$2,$3,$4,1,'GLOBAL')`,
+      [code, nameCanon, type, normal]
+    );
+  } else {
+    await query(
+      `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active)
+       VALUES ($1,$2,$3,$4,1)`,
+      [code, nameCanon, type, normal]
+    );
+  }
+
+  const check = await lookupByNormalizedName(nameCanon, hasSidCol ? sid : null);
   return check?.account_code || code;
 }
 
-/* ----------------- canonicalization sweep (legacy data) ----------------- */
+/* ----------------- canonicalization sweep (tenant-aware) ----------------- */
 
-/**
- * Normalize existing names in ledger_entries to their canonical form.
- * - Safe mappings only (Bank/Cash/GST variants; AR/AP label normalization).
- * - Bare party → AR/AP is applied only if a matching sub-ledger already exists.
- */
 export async function canonicalizeExistingData() {
   // If ledger_entries table doesn't exist yet, skip quietly
   try {
-    const info = await query("SELECT name FROM pragma_table_info('ledger_entries')");
-    const cols = info.rows || info;
-    if (!Array.isArray(cols) || cols.length === 0) return;
+    const names = await pragmaTableInfo("ledger_entries");
+    if (!names.length) return;
   } catch {
     return;
   }
 
-  // Pull distinct ledger strings from entries
+  const ledCols = await detectLedgerCols();
+  const coaHasSid = await tableHasColumn("chart_of_accounts", "session_id");
+
+  if (ledCols.hasSessionId) {
+    // Process per-tenant
+    const { rows: distinct } = await query(`
+      SELECT session_id, name
+        FROM (
+          SELECT session_id, debit_account  AS name FROM ledger_entries
+          UNION
+          SELECT session_id, credit_account AS name FROM ledger_entries
+        ) x
+       WHERE name IS NOT NULL AND TRIM(name) <> ''
+       GROUP BY session_id, name
+       ORDER BY session_id, name
+    `);
+
+    for (const r of distinct || []) {
+      const sid = r.session_id;
+      const oldName = r.name;
+      const newName = await resolveCanonicalName(oldName, coaHasSid ? sid : null);
+      if (!newName || namesEqual(oldName, newName)) continue;
+
+      // Ensure the canonical ledger exists for this tenant
+      await ensureLedgerExists(newName, sid);
+
+      // Update entries for THIS tenant only
+      await query(
+        `UPDATE ledger_entries SET debit_account = $1 WHERE session_id = $2 AND debit_account = $3`,
+        [newName, sid, oldName]
+      );
+      await query(
+        `UPDATE ledger_entries SET credit_account = $1 WHERE session_id = $2 AND credit_account = $3`,
+        [newName, sid, oldName]
+      );
+
+      // Optionally mark the old ledger inactive in tenant COA (if present)
+      if (coaHasSid) {
+        await query(
+          `UPDATE chart_of_accounts SET is_active = 0 WHERE session_id = $1 AND LOWER(name) = LOWER($2)`,
+          [sid, oldName]
+        );
+      } else {
+        await query(
+          `UPDATE chart_of_accounts SET is_active = 0 WHERE LOWER(name) = LOWER($1)`,
+          [oldName]
+        );
+      }
+    }
+    return;
+  }
+
+  // Global path (no session_id on ledger_entries)
   const ledgers = await query(`
     SELECT name FROM (
       SELECT DISTINCT debit_account AS name FROM ledger_entries
@@ -481,10 +710,10 @@ export async function canonicalizeExistingData() {
 
   for (const r of ledgers.rows || []) {
     const oldName = r.name;
-    const newName = await resolveCanonicalName(oldName);
+    const newName = await resolveCanonicalName(oldName, null);
     if (!newName || namesEqual(oldName, newName)) continue;
 
-    // Ensure the canonical ledger exists in CoA
+    // Ensure the canonical ledger exists (GLOBAL or legacy table)
     await ensureLedgerExists(newName);
 
     // Update entries
@@ -504,3 +733,9 @@ export async function canonicalizeExistingData() {
     );
   }
 }
+
+export {
+  canonicalizeLedgerName,
+  resolveCanonicalName,
+  lookupByNormalizedName, // (exported in case you want to reuse directly)
+};

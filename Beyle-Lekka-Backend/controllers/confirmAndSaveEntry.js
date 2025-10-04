@@ -1,10 +1,14 @@
-﻿// controllers/confirmAndSaveEntry.js (drop-in replacement)
-// Atomic posting; supports cents-based storage if present; robust PRAGMA detection.
+﻿// controllers/confirmAndSaveEntry.js
+// Atomic posting; tenant-safe; supports cents-based storage if present; robust column + dialect detection (SQLite & Postgres).
 
 import { query, withTx } from "../services/db.js";
 import { randomUUID } from "crypto";
 
-import { validateAndPreparePreview, pairForLedger } from "../utils/jeCore.js";
+// NOTE: we no longer use validateAndPreparePreview() here because we want the same validation
+// stack used in preview (including funds/facility guard). Use runValidation instead.
+import { runValidation } from "../utils/validation/index.js";
+
+import { pairForLedger } from "../utils/jeCore.js";
 import { ensureLedgerExists } from "../utils/coaService.js";
 
 import { generateInvoiceDoc } from "../utils/docGenerators/invoice.js";
@@ -14,7 +18,11 @@ import { generatePaymentVoucherDoc } from "../utils/docGenerators/paymentVoucher
 import { getSnapshot } from "../utils/preview/snapshotStore.js";
 import { finalizeReservation } from "../services/series.js";
 
-// ---------- helpers ----------
+// NEW: release preview holds so DB guard triggers don't block our own post
+import { releaseFundsHolds } from "../utils/preview/fundsHolds.js";
+
+/* ------------------------ helpers ------------------------ */
+
 const toCents = (v) => {
   if (v === undefined || v === null) return 0;
   if (typeof v === "number") return Math.round(v * 100);
@@ -23,58 +31,160 @@ const toCents = (v) => {
   return Number.isFinite(n) ? Math.round(n * 100) : 0;
 };
 
-const appendDocRefToNarration = (lines, docType, number) => {
-  if (!Array.isArray(lines) || !docType || !number) return lines || [];
-  const tag = `[${String(docType).toUpperCase()} #${number}]`;
-  return lines.map(l => ({ ...l, narration: l.narration ? `${l.narration} ${tag}` : tag }));
-};
-
-async function ensureAccountsExistForJournal(journal) {
+// Ensure COA accounts exist for THIS tenant (sid)
+async function ensureAccountsExistForJournal(journal, sid) {
   const seen = new Set();
   for (const e of journal || []) {
     if (e && typeof e.account === "string") {
       const name = e.account.trim();
       if (name && !seen.has(name)) {
-        await ensureLedgerExists(name);
+        await ensureLedgerExists(name, sid); // tenant-aware
         seen.add(name);
       }
     }
   }
 }
 
-let _columnsCache = null;
-async function detectColumns() {
-  if (_columnsCache) return _columnsCache;
+/* ---------- robust, cached column detection (PG + SQLite) ---------- */
 
-  // Use SELECT on pragma_table_info to guarantee rows with better-sqlite3
-  const led = await query(`SELECT name FROM pragma_table_info('ledger_entries')`);
-  const doc = await query(`SELECT name FROM pragma_table_info('documents')`);
-  const ledNames = (led.rows || []).map(r => r.name || r.NAME);
-  const docNames = (doc.rows || []).map(r => r.name || r.NAME);
+const _columnsCache = new Map(); // table -> Set(columns)
 
-  const hasAmountCents = ledNames.includes("amount_cents");
-  const hasAmount = ledNames.includes("amount");
-  const hasGrossAmountCents = docNames.includes("gross_amount_cents");
-  const hasGrossAmount = docNames.includes("gross_amount");
-
-  _columnsCache = { hasAmountCents, hasAmount, hasGrossAmountCents, hasGrossAmount };
-  return _columnsCache;
+function safeIdent(t) {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(t)) throw new Error(`Invalid identifier: ${t}`);
+  return t;
 }
 
-// ---------- main ----------
+async function columnsOf(table) {
+  const key = table.toLowerCase();
+  if (_columnsCache.has(key)) return _columnsCache.get(key);
+
+  const t = safeIdent(table);
+  let cols = new Set();
+
+  // Try Postgres information_schema first
+  try {
+    const r = await query(
+      `SELECT lower(column_name) AS name
+         FROM information_schema.columns
+        WHERE lower(table_name) = lower($1)`,
+      [t]
+    );
+    if (Array.isArray(r.rows) && r.rows.length) {
+      cols = new Set(r.rows.map((x) => x.name));
+      _columnsCache.set(key, cols);
+      return cols;
+    }
+  } catch (_) {}
+
+  // Fallback: SQLite PRAGMA (must interpolate identifier; we validated it)
+  try {
+    const r2 = await query(`PRAGMA table_info(${t})`);
+    if (Array.isArray(r2.rows) && r2.rows.length) {
+      cols = new Set(
+        r2.rows.map((x) => String(x.name ?? x.NAME ?? "").toLowerCase()).filter(Boolean)
+      );
+    }
+  } catch (_) {}
+
+  _columnsCache.set(key, cols);
+  return cols;
+}
+
+async function detectColumns() {
+  const led = await columnsOf("ledger_entries");
+  const doc = await columnsOf("documents");
+  const idem = await columnsOf("idempotency_keys");
+  const series = await columnsOf("series_reservations");
+  const snaps = await columnsOf("preview_snapshots");
+
+  return {
+    // ledger
+    hasAmountCents: led.has("amount_cents"),
+    hasAmount: led.has("amount"),
+    ledgerHasSession: led.has("session_id"),
+    // documents
+    docHasGrossAmountCents: doc.has("gross_amount_cents"),
+    docHasGrossAmount: doc.has("gross_amount"),
+    docHasSession: doc.has("session_id"),
+    docHasCreatedBy: doc.has("created_by"),
+    // idempotency
+    idemHasSession: idem.has("session_id"),
+    // series/snapshots
+    seriesHasSession: series.has("session_id"),
+    snapsHasSession: snaps.has("session_id"),
+  };
+}
+
+// Per-tenant idempotency (if supported)
+async function upsertIdempotencyKey(key, sid, flags) {
+  if (!key) return;
+  const { idemHasSession } = flags || {};
+  try {
+    if (idemHasSession) {
+      // Postgres preferred
+      await query(
+        `INSERT INTO idempotency_keys (key, session_id) VALUES ($1,$2)
+         ON CONFLICT(key, session_id) DO NOTHING`,
+        [key, sid]
+      );
+    } else {
+      await query(
+        `INSERT INTO idempotency_keys (key) VALUES ($1)
+         ON CONFLICT(key) DO NOTHING`,
+        [key]
+      );
+    }
+  } catch {
+    // SQLite fallback
+    try {
+      if (idemHasSession) {
+        await query(`INSERT OR IGNORE INTO idempotency_keys (key, session_id) VALUES ($1,$2)`, [
+          key,
+          sid,
+        ]);
+      } else {
+        await query(`INSERT OR IGNORE INTO idempotency_keys (key) VALUES ($1)`, [key]);
+      }
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/* ------------------------ main ------------------------ */
+
 export const confirmAndSaveEntry = async (req, res) => {
   try {
-    const { previewId, hash, idempotencyKey, sessionId = "default-session" } = req.body || {};
-    const cols = await detectColumns();
+    if (typeof req.sessionId === "undefined") {
+      return res
+        .status(500)
+        .json({ success: false, ok: false, error: "Tenant middleware not initialized." });
+    }
+    const sid = req.sessionId; // string for tenant, null for admin ALL
+    if (sid === null) {
+      // Writes must be scoped to a concrete tenant
+      return res
+        .status(400)
+        .json({ success: false, ok: false, error: "Workspace context required for posting." });
+    }
 
-    // Prefer snapshot flow (preview -> confirm)
+    const { previewId, hash, idempotencyKey } = req.body || {};
+    const flags = await detectColumns();
+
+    // -------- Snapshot flow (preview -> confirm) --------
     if (previewId && hash) {
       const snap = await getSnapshot(previewId);
       if (!snap || snap.status !== "ACTIVE") {
         return res.status(410).json({ success: false, error: "Preview expired or already used" });
       }
       if (String(snap.hash) !== String(hash)) {
-        return res.status(409).json({ success: false, error: "Preview content changed; re-preview required" });
+        return res
+          .status(409)
+          .json({ success: false, error: "Preview content changed; re-preview required" });
+      }
+      // If snapshots are tenant-scoped, enforce same-tenant posting
+      if (flags.snapsHasSession && snap.session_id && snap.session_id !== sid) {
+        return res.status(409).json({ success: false, error: "Preview belongs to another workspace" });
       }
 
       const payload = snap.payload || {};
@@ -82,58 +192,76 @@ export const confirmAndSaveEntry = async (req, res) => {
       const sDocModel = payload.docModel || {};
       const sJournal = Array.isArray(payload.journal) ? payload.journal : [];
 
-      // Ensure ledgers exist for accounts
-      await ensureAccountsExistForJournal(sJournal);
+      // IMPORTANT: We DO NOT mutate narrations here. What was previewed is what gets posted.
+      // Ensure tenant-scoped ledgers exist
+      await ensureAccountsExistForJournal(sJournal, sid);
 
-      // Pair exactly as preview (jeCore pairs via cents internally, outputs amount in units)
-      const withRef = appendDocRefToNarration(sJournal, sDocType, sDocModel.number);
-      const pairs = pairForLedger(withRef);
+      // Pair exactly as previewed
+      const pairs = pairForLedger(sJournal);
       if (!pairs.length) {
-        return res.status(422).json({ success: false, error: "Snapshot journal unbalanced or empty." });
+        return res
+          .status(422)
+          .json({ success: false, error: "Snapshot journal unbalanced or empty." });
       }
 
       let insertedDocId = null;
 
       await withTx(async () => {
-        // 1) Idempotency (safe retry)
-        if (idempotencyKey) {
-          await query("INSERT OR IGNORE INTO idempotency_keys (key) VALUES ($1)", [idempotencyKey]);
+        // 0) Release our own preview holds so DB guard triggers don't subtract them
+        try {
+          await releaseFundsHolds({ sessionId: sid, previewId });
+        } catch (e) {
+          // Non-fatal; DB trigger still protects overall integrity
+          // eslint-disable-next-line no-console
+          console.warn("Funds holds release failed (non-fatal):", e?.message || e);
         }
 
-        // 2) Insert the document row (if any)
+        // 1) Idempotency (per-tenant if supported)
+        await upsertIdempotencyKey(idempotencyKey, sid, flags);
+
+        // 2) Insert the document row (if any), stamping session when supported
         if (sDocType && sDocType !== "journal" && (sDocModel.number || sDocModel.date)) {
           insertedDocId = randomUUID();
-          const dateISO = (sDocModel.date || new Date().toISOString().slice(0,10)).slice(0,10);
-          // Try generic party mapping (supports {party} or known keys from different flows)
+          const dateISO = (sDocModel.date || new Date().toISOString().slice(0, 10)).slice(0, 10);
           const party =
-            sDocModel.party || sDocModel.customer || sDocModel.buyer || sDocModel.buyerName || sDocModel.vendor || null;
+            sDocModel.party ||
+            sDocModel.customer ||
+            sDocModel.buyer ||
+            sDocModel.buyerName ||
+            sDocModel.vendor ||
+            null;
 
           const grossUnits = sDocModel.total != null ? Number(sDocModel.total) : null;
           const grossCents = grossUnits != null ? toCents(grossUnits) : null;
 
-          if (cols.hasGrossAmountCents) {
-            await query(
-              `INSERT INTO documents (id, doc_type, number, date, party_name, gross_amount_cents, status, file_url, created_by)
-               VALUES ($1,$2,$3,$4,$5,$6,'FINALIZED',NULL,$7)`,
-              [insertedDocId, sDocType, sDocModel.number || null, dateISO, party, grossCents, req.body?.userId || null]
-            );
-          } else if (cols.hasGrossAmount) {
-            await query(
-              `INSERT INTO documents (id, doc_type, number, date, party_name, gross_amount, status, file_url, created_by)
-               VALUES ($1,$2,$3,$4,$5,$6,'FINALIZED',NULL,$7)`,
-              [insertedDocId, sDocType, sDocModel.number || null, dateISO, party, grossUnits || null, req.body?.userId || null]
-            );
-          } else {
-            // documents table without any gross amount column
-            await query(
-              `INSERT INTO documents (id, doc_type, number, date, party_name, status, file_url, created_by)
-               VALUES ($1,$2,$3,$4,$5,'FINALIZED',NULL,$6)`,
-              [insertedDocId, sDocType, sDocModel.number || null, dateISO, party, req.body?.userId || null]
-            );
+          const cols = ["id", "doc_type", "number", "date", "party_name"];
+          const vals = [insertedDocId, sDocType, sDocModel.number || null, dateISO, party];
+
+          if (flags.docHasGrossAmountCents) {
+            cols.push("gross_amount_cents");
+            vals.push(grossCents);
+          } else if (flags.docHasGrossAmount) {
+            cols.push("gross_amount");
+            vals.push(grossUnits || null);
           }
+
+          cols.push("status", "file_url");
+          vals.push("FINALIZED", null);
+
+          if (flags.docHasCreatedBy) {
+            cols.push("created_by");
+            vals.push(req.body?.userId || null);
+          }
+          if (flags.docHasSession) {
+            cols.push("session_id");
+            vals.push(sid);
+          }
+
+          const ph = cols.map((_, i) => `$${i + 1}`).join(",");
+          await query(`INSERT INTO documents (${cols.join(",")}) VALUES (${ph})`, vals);
         }
 
-        // 3) Insert ledger entries (uses cents if column exists); link to doc if we created one.
+        // 3) Insert ledger entries (amount_cents if present; else amount) — always stamp session_id
         const insertSqlCents = `
           INSERT INTO ledger_entries
             (id, session_id, debit_account, credit_account, amount_cents, narration, transaction_date, document_id)
@@ -147,41 +275,65 @@ export const confirmAndSaveEntry = async (req, res) => {
 
         for (const p of pairs) {
           const rowId = randomUUID();
-          await query(cols.hasAmountCents ? insertSqlCents : insertSqlUnits, [
+          await query(flags.hasAmountCents ? insertSqlCents : insertSqlUnits, [
             rowId,
-            sessionId,
+            sid, // tenant
             p.debit_account,
             p.credit_account,
-            cols.hasAmountCents ? toCents(p.amount) : Number(p.amount),
+            flags.hasAmountCents ? toCents(p.amount) : Number(p.amount),
             p.narration || "",
-            p.transaction_date || new Date().toISOString().slice(0,10),
-            insertedDocId
+            p.transaction_date || new Date().toISOString().slice(0, 10),
+            insertedDocId,
           ]);
         }
 
-        // 4) Finalize series reservation + mark snapshot used
+        // 4) Finalize series reservation + mark snapshot used (scoped when supported)
         if (snap.reservation_id) {
-          try { await finalizeReservation(snap.reservation_id); } catch {}
-          await query("UPDATE series_reservations SET status='USED' WHERE reservation_id=$1", [snap.reservation_id]);
+          try {
+            await finalizeReservation(snap.reservation_id);
+          } catch {}
+          let sql = `UPDATE series_reservations SET status='USED' WHERE reservation_id=$1`;
+          const params = [snap.reservation_id];
+          if (flags.seriesHasSession) {
+            sql += ` AND session_id=$2`;
+            params.push(sid);
+          }
+          await query(sql, params);
         }
-        await query("UPDATE preview_snapshots SET status='USED' WHERE preview_id=$1", [previewId]);
+
+        {
+          let sql = `UPDATE preview_snapshots SET status='USED' WHERE preview_id=$1`;
+          const params = [previewId];
+          if (flags.snapsHasSession) {
+            sql += ` AND session_id=$2`;
+            params.push(sid);
+          }
+          await query(sql, params);
+        }
       });
 
-      // 5) Try to generate a human document file (non-blocking)
+      // 5) Document generation (best-effort, updates scoped if supported)
       let docMeta = null;
       if (insertedDocId && sDocType && sDocType !== "journal") {
         try {
           const structured = { docType: sDocType, documentFields: { [sDocType]: sDocModel } };
           if (sDocType === "invoice") docMeta = await generateInvoiceDoc({ structured });
           else if (sDocType === "receipt") docMeta = await generateReceiptDoc({ structured });
-          else if (sDocType === "payment_voucher") docMeta = await generatePaymentVoucherDoc({ structured });
+          else if (sDocType === "payment_voucher")
+            docMeta = await generatePaymentVoucherDoc({ structured });
 
           if (docMeta?.filename || docMeta?.url) {
-            await query("UPDATE documents SET file_url=$1 WHERE id=$2",
-              [docMeta.url || docMeta.filename, insertedDocId]);
+            let sql = `UPDATE documents SET file_url=$1 WHERE id=$2`;
+            const params = [docMeta.url || docMeta.filename, insertedDocId];
+            if (flags.docHasSession) {
+              sql += ` AND session_id=$3`;
+              params.push(sid);
+            }
+            await query(sql, params);
           }
         } catch (e) {
-          console.warn("Document generation failed (posting already committed):", e?.message);
+          // eslint-disable-next-line no-console
+          console.warn("Document generation failed (posting committed):", e?.message);
         }
       }
 
@@ -190,31 +342,60 @@ export const confirmAndSaveEntry = async (req, res) => {
         ok: true,
         status: "posted",
         posted: pairs.length,
-        ...(insertedDocId ? {
-          document: { id: insertedDocId, docType: sDocType, number: sDocModel.number || null, ...(docMeta || {}) }
-        } : {})
+        ...(insertedDocId
+          ? {
+              document: {
+                id: insertedDocId,
+                docType: sDocType,
+                number: sDocModel.number || null,
+                ...(docMeta || {}),
+              },
+            }
+          : {}),
       });
     }
 
-    // ----- Legacy direct post path (no previewId/hash) -----
+    // -------- Legacy direct post path (no previewId/hash) --------
     const journal = Array.isArray(req.body?.journal) ? req.body.journal : [];
     if (!journal.length) {
-      return res.status(400).json({ success:false, error: "journal[] is required when previewId/hash not provided." });
+      return res.status(400).json({
+        success: false,
+        error: "journal[] is required when previewId/hash not provided.",
+      });
     }
 
-    const check = await validateAndPreparePreview(journal, { allowFutureDates:false });
-    if (!check.ok) {
-      return res.status(422).json({ success:false, error:"Validation failed", details: check.errors || [] });
-    }
-    await ensureAccountsExistForJournal(check.normalized);
+    // Build a minimal doc model so validation (incl. funds guard) can run
+    const firstDate = journal.find(l => typeof l?.date === "string" && l.date)?.date;
+    const docModel = { date: firstDate || new Date().toISOString().slice(0, 10) };
 
-    const pairs = pairForLedger(check.normalized);
+    const validation = await runValidation({
+      docType: "journal",
+      journal,
+      docModel,
+      tz: "Asia/Kolkata",
+      mode: "preview",
+      sessionId: sid
+    });
+
+    if (Array.isArray(validation?.errors) && validation.errors.length) {
+      return res.status(422).json({
+        success: false,
+        error: "Validation failed",
+        errors: validation.errors,
+        warnings: validation.warnings || []
+      });
+    }
+
+    // Ensure ledgers exist for this tenant only after validation passes
+    await ensureAccountsExistForJournal(journal, sid);
+
+    const pairs = pairForLedger(journal);
     if (!pairs.length) {
-      return res.status(422).json({ success:false, error:"Unbalanced journal" });
+      return res.status(422).json({ success: false, error: "Unbalanced journal" });
     }
 
     await withTx(async () => {
-      if (idempotencyKey) await query("INSERT OR IGNORE INTO idempotency_keys (key) VALUES ($1)", [idempotencyKey]);
+      await upsertIdempotencyKey(idempotencyKey, sid, flags);
 
       const insertSqlCents = `
         INSERT INTO ledger_entries
@@ -226,19 +407,31 @@ export const confirmAndSaveEntry = async (req, res) => {
           (id, session_id, debit_account, credit_account, amount, narration, transaction_date, document_id)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
       `;
+
       for (const p of pairs) {
         const rowId = randomUUID();
-        await query(cols.hasAmountCents ? insertSqlCents : insertSqlUnits, [
-          rowId, sessionId, p.debit_account, p.credit_account,
-          cols.hasAmountCents ? toCents(p.amount) : Number(p.amount),
-          p.narration || "", p.transaction_date || new Date().toISOString().slice(0,10), null
+        await query(flags.hasAmountCents ? insertSqlCents : insertSqlUnits, [
+          rowId,
+          sid, // tenant
+          p.debit_account,
+          p.credit_account,
+          flags.hasAmountCents ? toCents(p.amount) : Number(p.amount),
+          p.narration || "",
+          p.transaction_date || new Date().toISOString().slice(0, 10),
+          null,
         ]);
       }
     });
 
-    return res.status(200).json({ success:true, ok:true, status:"posted", posted: pairs.length });
+    return res
+      .status(200)
+      .json({ success: true, ok: true, status: "posted", posted: pairs.length });
   } catch (err) {
+    // eslint-disable-next-line no-console
     console.error("Error in confirmAndSaveEntry:", err);
-    return res.status(500).json({ success:false, error: err?.message || "Failed to confirm and save journal entry." });
+    return res.status(500).json({
+      success: false,
+      error: err?.message || "Failed to confirm and save journal entry.",
+    });
   }
 };

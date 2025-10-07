@@ -1,3 +1,11 @@
 backend/.env
 .env
 
+
+# artifacts
+**/*.zip
+**/*.db
+**/*.db-shm
+**/*.db-wal
+Beyle-Lekka-Backend/generated_docs/
+

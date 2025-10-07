@@ -3,12 +3,19 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import routes from "./routes/api.js";
-import { query } from "./services/db.js";
+import * as DB from "./services/db.js";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import * as CoA from "./utils/coaService.js"; // single consolidated import
+import * as CoA from "./utils/coaService.js";
 import adminRoutes from "./routes/admin.js";
+import { randomUUID } from "crypto";
+
+/* ---------- Flags & Health ---------- */
+import FlagsModule from "./utils/flags.js";
+import HealthzModule from "./controllers/healthzController.js";
+const { enforceKillSwitches, getFlags } = FlagsModule;
+const { getHealthz } = HealthzModule;
 
 /* ---------- Load env; let .env override stray shell vars ---------- */
 dotenv.config({ override: true });
@@ -33,36 +40,40 @@ const PORT = Number(
     : (process.env.BACKEND_PORT || 3000)
 );
 
+/* ---------- Provide a DB handle for /healthz ---------- */
+const dbHandle =
+  DB?.pool /* pg.Pool */ ||
+  DB?.knex /* knex instance */ ||
+  DB?.db /* generic client/pool */ ||
+  (DB?.query ? { query: DB.query } : null);
+if (dbHandle) app.set("db", dbHandle);
+
 /* ---------- CORS (configurable) ---------- */
 const parseCSV = (s = "") =>
-  s.split(",")
+  s
+    .split(",")
     .map((x) => x.trim())
     .filter(Boolean);
 
 const ALLOWED = parseCSV(process.env.ALLOWED_ORIGINS);
 
-// headers we actually use across the app
 const COMMON_ALLOWED_HEADERS = [
   "Content-Type",
   "X-Workspace-Id",
   "X-Admin-Key",
   "X-Debug",
   "Authorization",
+  "X-Request-Id",
 ];
 
 const BASE_CORS = {
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: COMMON_ALLOWED_HEADERS,
-  exposedHeaders: ["Content-Disposition"],
-  maxAge: 86400, // cache preflight for 1 day
+  exposedHeaders: ["Content-Disposition", "X-Request-Id"],
+  maxAge: 86400,
 };
 
-/**
- * - Production: if ALLOWED_ORIGINS set, use allowlist strictly.
- * - Dev: allow any localhost/127.0.0.1/::1 to avoid being bricked by port bumps.
- *        If ALLOWED_ORIGINS also provided, those will be allowed too.
- */
 const corsOptions =
   isProd && ALLOWED.length > 0
     ? { origin: ALLOWED, ...BASE_CORS }
@@ -88,8 +99,7 @@ const corsOptions =
       };
 
 app.use(cors(corsOptions));
-// handle all preflight requests
-app.options("*", cors(corsOptions));
+app.options("*", cors(corsOptions)); // preflights
 
 /* ---------- Core middleware ---------- */
 app.disable("x-powered-by");
@@ -97,9 +107,120 @@ app.use(express.json({ limit: "20mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.set("trust proxy", true);
 
-/* ---------- Tiny request logger ---------- */
-app.use((req, _res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
+/* ---------- Request correlation & tiny logger ---------- */
+app.use((req, res, next) => {
+  const reqId = req.get("X-Request-Id") || randomUUID();
+  req.requestId = reqId;
+  res.setHeader("X-Request-Id", reqId);
+
+  req.workspaceId = req.get("X-Workspace-Id") || "unknown";
+
+  const start = process.hrtime.bigint();
+  console.log(
+    `[${new Date().toISOString()}] ${req.method} ${req.originalUrl} ` +
+      `(ws=${req.workspaceId}, rid=${req.requestId})`
+  );
+
+  res.on("finish", () => {
+    const end = process.hrtime.bigint();
+    const ms = Number(end - start) / 1e6;
+    console.log(
+      `↳ ${res.statusCode} ${req.method} ${req.originalUrl} ` +
+        `in ${ms.toFixed(1)}ms (ws=${req.workspaceId}, rid=${req.requestId})`
+    );
+  });
+
+  next();
+});
+
+/* ---------- Feature-flag kill switches (must be before routers) ---------- */
+app.use(enforceKillSwitches);
+
+/* ---------- Metrics: lazy-load & no-op fallback ---------- */
+function makeNoopHistogram() {
+  return {
+    startTimer() {
+      return () => {};
+    },
+    observe() {},
+    labels() { return makeNoopHistogram(); },
+  };
+}
+let histograms = {
+  hPreview: makeNoopHistogram(),
+  hPost: makeNoopHistogram(),
+  hReco: makeNoopHistogram(),
+  hImportPreview: makeNoopHistogram(),
+  hImportCommit: makeNoopHistogram(),
+};
+let metricsHandler = (_req, res) => {
+  res.status(501).type("text/plain").send("# metrics disabled\n");
+};
+
+try {
+  // Try to import metrics module. It will itself attempt to load prom-client.
+  const MetricsModule = await import("./utils/metrics.js");
+  const M = MetricsModule.default ?? MetricsModule;
+  if (M?.histograms) histograms = M.histograms;
+  if (M?.metricsHandler) metricsHandler = M.metricsHandler;
+} catch (e) {
+  console.warn("Metrics disabled (utils/metrics.js not available):", e?.message || e);
+}
+
+/* ---------- Basic per-route metrics (preview/post/reco/import) ---------- */
+function pickHistogram(req) {
+  const u = (req.originalUrl || req.url || "").toLowerCase();
+
+  // JE preview — support both new and legacy routes
+  if (
+    (u.startsWith("/api/orchestrateprompt") && req.method === "POST") ||
+    u.startsWith("/api/orchestrate/preview")
+  ) {
+    return { hist: histograms.hPreview, route: "/orchestrate/preview" };
+  }
+
+  // JE post/confirm — support both new and legacy routes
+  if (
+    (u.startsWith("/api/confirmandsaveentry") && req.method === "POST") ||
+    u.startsWith("/api/orchestrate/confirm") ||
+    (u.startsWith("/api/ledger") && (req.method === "POST" || req.method === "PUT")) ||
+    u.includes("/entries/confirm")
+  ) {
+    return { hist: histograms.hPost, route: "/orchestrate/post" };
+  }
+
+  // Bank reconciliation
+  if (u.startsWith("/api/bankreco") || u.includes("/bankreco/")) {
+    return { hist: histograms.hReco, route: "/bankreco" };
+  }
+
+  // Imports: preview vs commit
+  if (/^\/api\/import\/.+\/preview/.test(u)) {
+    return { hist: histograms.hImportPreview, route: "/import/preview" };
+  }
+  if (
+    /^\/api\/import\/.+\/commit/.test(u) ||
+    (u.startsWith("/api/import") && req.method === "POST")
+  ) {
+    return { hist: histograms.hImportCommit, route: "/import/commit" };
+  }
+
+  return null;
+}
+
+app.use((req, res, next) => {
+  const picked = pickHistogram(req);
+  if (!picked) return next();
+
+  const end = picked.hist.startTimer({
+    route: picked.route,
+    workspace: req.workspaceId || "unknown",
+  });
+  const done = () => {
+    try { end(); } catch { /* ignore */ }
+  };
+  res.on("finish", done);
+  res.on("close", done);
   next();
 });
 
@@ -113,14 +234,24 @@ app.use("/files", express.static(FILES_DIR));
 /* ---------- Admin routes (before main API) ---------- */
 app.use("/api/admin", adminRoutes);
 
-/* ---------- Health & readiness ---------- */
+/* ---------- Health / Ready / Healthz / Metrics ---------- */
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, env: ENV, time: new Date().toISOString() });
+  res.json({
+    ok: true,
+    env: ENV,
+    time: new Date().toISOString(),
+    flags: getFlags(),
+  });
 });
 
 app.get("/ready", async (_req, res) => {
   try {
-    const r = await query("SELECT 1 AS ok");
+    const r = await (DB?.query
+      ? DB.query("SELECT 1 AS ok")
+      : dbHandle?.query
+      ? dbHandle.query("SELECT 1 AS ok")
+      : Promise.resolve({ rows: [{ ok: 1 }] }));
+
     const ok = Array.isArray(r?.rows)
       ? r.rows[0]?.ok === 1 || r.rows[0]?.ok === "1"
       : true;
@@ -130,6 +261,12 @@ app.get("/ready", async (_req, res) => {
     res.status(500).json({ ok: false, error: err?.message || String(err) });
   }
 });
+
+// Deep health with DB round-trip & flags echo
+app.get("/healthz", getHealthz);
+
+// Prometheus metrics endpoint
+app.get("/metrics", metricsHandler);
 
 /* ---------- API routes ---------- */
 app.use("/api", routes);
@@ -163,8 +300,7 @@ try {
   }
 } catch (e) {
   console.error("Startup initialization failed:", e);
-  // If you want to fail hard on init problems, uncomment the next line:
-  // process.exit(1);
+  // process.exit(1); // uncomment to fail hard on init problems
 }
 
 /* ---------- Start server ---------- */

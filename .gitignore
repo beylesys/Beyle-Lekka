@@ -1,5 +1,3 @@
-
-# ignore binaries & env
-*.zip
-.env*
+backend/.env
+.env
 

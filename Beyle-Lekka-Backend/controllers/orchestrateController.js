@@ -10,13 +10,125 @@ import { createSnapshot } from "../utils/preview/snapshotStore.js";
 
 // Default spending account + preview holds + COA auto-create
 import { getDefaultSpendingAccount } from "../services/workspaceSettings.js";
-import { ensureLedgerExists } from "../utils/coaService.js";
+import {
+  ensureLedgerExists,
+  ensureParentForFamily,
+  ensureLedgerExistsWithMapping
+} from "../utils/coaService.js";
 import { createFundsHolds } from "../utils/preview/fundsHolds.js";
 
 /* =======================================================================
-   Deterministic helpers
+   Date helpers: “today” means today; relative dates are anchored to today
+   ======================================================================= */
+
+const DEFAULT_TZ = "Asia/Kolkata";
+
+function todayISOInTZ(tz = DEFAULT_TZ) {
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  const parts = Object.fromEntries(fmt.formatToParts(new Date()).map(p => [p.type, p.value]));
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+function isISODate(s) {
+  return typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
+}
+function dateShiftFromTZ(days = 0, tz = DEFAULT_TZ) {
+  // Base on "today" in tz, then add days
+  const today = todayISOInTZ(tz);
+  const [y, m, d] = today.split("-").map(Number);
+  const utcMidnight = Date.UTC(y, m - 1, d); // start-of-day in tz, projected to UTC
+  const shifted = new Date(utcMidnight + days * 86400000);
+  // Return as YYYY-MM-DD (UTC slice is fine because time is already midnight UTC anchor)
+  const yyyy = shifted.getUTCFullYear();
+  const mm = String(shifted.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(shifted.getUTCDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+/** Parse relative phrases (today | yesterday | day before yesterday | N days ago/back/before) from text or a raw field value. */
+function parseRelativeDateFrom(textOrField, tz = DEFAULT_TZ) {
+  const raw = String(textOrField || "").trim().toLowerCase();
+  if (!raw) return null;
+
+  // direct tokens
+  if (/\btoday\b/.test(raw)) return todayISOInTZ(tz);
+  if (/\byesterday\b/.test(raw)) return dateShiftFromTZ(-1, tz);
+  if (/\bday\s+before\s+yesterday\b/.test(raw)) return dateShiftFromTZ(-2, tz);
+  if (/\btomorrow\b/.test(raw)) return dateShiftFromTZ(+1, tz); // will be clamped later
+
+  // “N days ago/back/before”
+  const m = raw.match(/\b(\d{1,3})\s*day(?:s)?\s*(?:ago|back|before)\b/);
+  if (m) {
+    const n = Number(m[1]);
+    if (Number.isFinite(n)) return dateShiftFromTZ(-n, tz);
+  }
+
+  // “in N days” (rare; clamp will prevent future dates if you want)
+  const m2 = raw.match(/\bin\s+(\d{1,3})\s*day(?:s)?\b/);
+  if (m2) {
+    const n = Number(m2[1]);
+    if (Number.isFinite(n)) return dateShiftFromTZ(+n, tz);
+  }
+
+  return null;
+}
+
+/** Clamp a date to [booksStart, today] if a start date is provided. */
+function clampToBooksWindow(dateISO, booksStartISO = null, tz = DEFAULT_TZ) {
+  const today = todayISOInTZ(tz);
+  let d = isISODate(dateISO) ? dateISO : today;
+  if (booksStartISO && isISODate(booksStartISO) && d < booksStartISO) d = booksStartISO;
+  if (d > today) d = today;
+  return d;
+}
+
+/** Try to obtain a books start date from workspace settings (optional; safe if not exported). */
+async function getWorkspaceBooksStartDateOptional(sessionId) {
+  try {
+    const mod = await import("../services/workspaceSettings.js");
+    const fn = mod.getBooksStartDate || mod.getWorkspaceBooksStartDate || null;
+    if (typeof fn === "function") {
+      const v = await fn(sessionId);
+      if (typeof v === "string" && v) return v.slice(0, 10);
+    }
+  } catch {
+    /* ignore: not exported in some builds */
+  }
+  return null;
+}
+
+/**
+ * Normalize a preview/post date:
+ * 1) If ISO -> keep it.
+ * 2) Else if field equals “today/yesterday/…/N days ago” -> resolve relative.
+ * 3) Else if the surrounding text contains a relative phrase -> use that.
+ * 4) Else -> use today.
+ * 5) Finally clamp to [booksStart, today].
+ */
+async function normalizePreviewDate(candidate, { text = "", sessionId = null, tz = DEFAULT_TZ } = {}) {
+  const booksStart = sessionId ? await getWorkspaceBooksStartDateOptional(sessionId) : null;
+
+  let d = null;
+  if (isISODate(candidate)) {
+    d = candidate;
+  } else {
+    d = parseRelativeDateFrom(candidate, tz) ||
+        parseRelativeDateFrom(text, tz) ||
+        todayISOInTZ(tz);
+  }
+  return clampToBooksWindow(d, booksStart, tz);
+}
+
+/* =======================================================================
+   Deterministic helpers + small explanation framework
    ======================================================================= */
 const R2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+const INR = (x) => `₹${Number(x).toFixed(2)}`;
+
 const LEDGERS = {
   bank: "Bank",
   cash: "Cash",
@@ -28,6 +140,17 @@ const LEDGERS = {
   roundOffDr: "Round-off (Expense)",
 };
 
+function explainPush(explain, code, message, extra = {}) {
+  explain.push({ code, message, ...extra });
+}
+function explanationText(explain) {
+  if (!Array.isArray(explain) || explain.length === 0) return "Review and confirm the journal.";
+  return explain.map(e => `• ${e.message}`).join("\n");
+}
+
+/* =======================================================================
+   Payment mode normalization / detection
+   ======================================================================= */
 function normalizePayMode(raw) {
   const s = String(raw || "").toLowerCase();
   if (!s) return null;
@@ -49,18 +172,15 @@ function detectModeFromText(rawText) {
   return null;
 }
 
-// Modes that imply a bank account (we can safely default to the workspace bank if not named)
 const BANK_LIKE = new Set(["BANK", "UPI", "CARD", "CHEQUE"]);
 
-// Return an explicit mode only if it is stated in fields or raw text; do NOT guess.
 function explicitModeFromSignals(fields, rawText) {
   const fieldMode = normalizePayMode(fields?.payment_mode || fields?.mode);
   const textMode = detectModeFromText(rawText);
   return fieldMode || textMode || null;
 }
 
-// Do not override obviously non-instrument credits (capital, sales, creditors, tax, loans)
-function enforceCreditFromMode(journal, fields, rawTextForCues = "") {
+function enforceCreditFromMode(journal, fields, rawTextForCues = "", explain = null) {
   const fieldMode = normalizePayMode(fields?.payment_mode || fields?.mode);
   const textMode  = detectModeFromText(rawTextForCues);
   const mode = fieldMode || textMode;
@@ -70,24 +190,28 @@ function enforceCreditFromMode(journal, fields, rawTextForCues = "") {
   const crLine = j.find(l => Number(l?.credit || 0) > 0);
   if (!crLine) return j;
 
-  const name = String(crLine.account || "");
+  const before = String(crLine.account || "");
   const looksNonInstrument =
-    /capital|share|equity|sales|revenue|output\s*gst|gst\s*payable|creditors?|accounts\s*payable|loan|tds|duties|tax/i.test(name);
+    /capital|share|equity|sales|revenue|output\s*gst|gst\s*payable|creditors?|accounts\s*payable|loan|tds|duties|tax/i.test(before);
   if (looksNonInstrument) return j;
 
   crLine.account = (mode === "CASH") ? LEDGERS.cash : LEDGERS.bank;
+  if (explain && before !== crLine.account) {
+    explainPush(explain, "INSTRUMENT_CREDIT",
+      `Credited instrument set to “${crLine.account}” based on explicit mode (${mode}).`);
+  }
   return j;
 }
 
-function ensureGstSplit(journal, fields, opts = { assumeIntra: true, preferExpense: true, text: "" }) {
+function ensureGstSplit(journal, fields, opts = { assumeIntra: true, preferExpense: true, text: "" }, explain = null) {
   const subtotal = Number(fields?.subtotal_amount ?? fields?.subtotal);
   const taxes    = Number(fields?.tax_amount ?? fields?.taxes);
   const total    = Number(fields?.total_amount ?? fields?.total);
   if (![subtotal, taxes, total].every(Number.isFinite)) return journal;
   if (R2(subtotal + taxes) !== R2(total)) return journal;
 
-  const hasGSTInput = (journal || []).some(l => /GST Input/i.test(String(l?.account || "")));
-  if (hasGSTInput) return journal;
+  const hasGSTInputBefore = (journal || []).some(l => /GST Input/i.test(String(l?.account || "")));
+  if (hasGSTInputBefore) return journal;
 
   const credits = (journal || []).filter(l => Number(l?.credit || 0) > 0);
   const debits  = (journal || []).filter(l => Number(l?.debit  || 0) > 0);
@@ -113,25 +237,42 @@ function ensureGstSplit(journal, fields, opts = { assumeIntra: true, preferExpen
     out.push({ account: LEDGERS.inputSGST, debit: sgst, credit: 0, date: mainDr?.date, narration: mainDr?.narration || "" });
   }
   out.push({ account: credit?.account || LEDGERS.bank, debit: 0, credit: R2(total), date: credit?.date || mainDr?.date, narration: credit?.narration || "" });
+
+  if (explain) {
+    if (igst) {
+      explainPush(explain, "GST_SPLIT", `Split GST as IGST ${INR(igst)} with subtotal ${INR(subtotal)} = total ${INR(total)}.`);
+    } else {
+      explainPush(explain, "GST_SPLIT", `Split GST as CGST ${INR(cgst)} + SGST ${INR(sgst)} with subtotal ${INR(subtotal)} = total ${INR(total)}.`);
+    }
+  }
   return out;
 }
 
-function addRoundOff(journal) {
+function addRoundOff(journal, explain = null) {
   const dr = (journal || []).reduce((s,l)=>s + (Number(l?.debit)||0), 0);
   const cr = (journal || []).reduce((s,l)=>s + (Number(l?.credit)||0), 0);
   const delta = R2(dr - cr);
   if (Math.abs(delta) > 0 && Math.abs(delta) <= 0.05) {
-    if (delta > 0) journal.push({ account: LEDGERS.roundOffCr, debit: 0, credit: Math.abs(delta) });
-    else journal.push({ account: LEDGERS.roundOffDr, debit: Math.abs(delta), credit: 0 });
+    if (delta > 0) {
+      journal.push({ account: LEDGERS.roundOffCr, debit: 0, credit: Math.abs(delta) });
+      if (explain) explainPush(explain, "ROUND_OFF", `Added round‑off credit ${INR(Math.abs(delta))}.`);
+    } else {
+      journal.push({ account: LEDGERS.roundOffDr, debit: Math.abs(delta), credit: 0 });
+      if (explain) explainPush(explain, "ROUND_OFF", `Added round‑off debit ${INR(Math.abs(delta))}.`);
+    }
   }
   return journal;
 }
 
-function enforceAll(journalIn, fields, rawTextForCues = "") {
+function enforceAll(journalIn, fields, rawTextForCues = "", explain = null) {
   let j = Array.isArray(journalIn) ? journalIn.map(l => ({...l})) : [];
-  j = ensureGstSplit(j, fields, { assumeIntra: true, preferExpense: true, text: rawTextForCues });
-  j = enforceCreditFromMode(j, fields, rawTextForCues); // safe, non-intrusive
-  j = addRoundOff(j);
+  const before = JSON.stringify(j);
+  j = ensureGstSplit(j, fields, { assumeIntra: true, preferExpense: true, text: rawTextForCues }, explain);
+  j = enforceCreditFromMode(j, fields, rawTextForCues, explain);
+  j = addRoundOff(j, explain);
+  if (explain && before === JSON.stringify(j)) {
+    explainPush(explain, "NO_FIXUPS", "No deterministic fix‑ups were needed.");
+  }
   return j;
 }
 
@@ -172,24 +313,27 @@ function rewriteLargestSides(journal, debitAccount, creditAccount) {
   if (ci >= 0 && creditAccount) j[ci].account = creditAccount;
   return j;
 }
-async function applyContraIfDetected(journal, sessionId, rawText) {
+async function applyContraIfDetected(journal, sessionId, rawText, explain = null) {
   const intent = detectContraIntent(rawText);
   if (intent === "NONE") return { journal, applied: false };
+
   const bankAcct = await resolveBankInstrumentForContra(sessionId);
 
   if (intent === "BANK_TO_CASH") {
     const j = rewriteLargestSides(journal, LEDGERS.cash, bankAcct);
+    if (explain) explainPush(explain, "CONTRA", `Detected contra: Bank → Cash (${bankAcct} to Cash).`);
     return { journal: j, applied: true };
   }
   if (intent === "CASH_TO_BANK") {
     const j = rewriteLargestSides(journal, bankAcct, LEDGERS.cash);
+    if (explain) explainPush(explain, "CONTRA", `Detected contra: Cash → Bank (Cash to ${bankAcct}).`);
     return { journal: j, applied: true };
   }
   if (intent === "TRANSFER") {
-    // Best-effort: if "cash" mentioned it means bank↔cash; otherwise skip (we don't support bank↔bank here)
     const hasCash = /\bcash\b/i.test(String(rawText || ""));
     if (!hasCash) return { journal, applied: false };
     const j = rewriteLargestSides(journal, bankAcct, LEDGERS.cash);
+    if (explain) explainPush(explain, "CONTRA", `Detected contra transfer involving Cash (normalized to ${bankAcct} ↔ Cash).`);
     return { journal: j, applied: true };
   }
   return { journal, applied: false };
@@ -202,7 +346,8 @@ async function applyDefaultSpendingAccount(
   fields,
   sessionId,
   rawTextForCues = "",
-  intentHint = null
+  intentHint = null,
+  explain = null
 ) {
   const j = Array.isArray(journal) ? journal.map(r => ({ ...r })) : [];
   if (!j.length) return j;
@@ -227,11 +372,15 @@ async function applyDefaultSpendingAccount(
   if (intentHint === "payment_voucher") {
     let ci = -1, cmax = -1;
     j.forEach((l, i) => { const c = Number(l?.credit || 0); if (c > cmax) { cmax = c; ci = i; } });
+    const before = j[ci]?.account || null;
     if (ci >= 0) j[ci].account = acct; // override ANY guessed instrument
+    if (explain && before !== acct) explainPush(explain, "INSTRUMENT_PAYMENT", `Payment instrument set to “${acct}” (mode: ${mode}).`);
   } else if (intentHint === "receipt") {
     let di = -1, dmax = -1;
     j.forEach((l, i) => { const d = Number(l?.debit || 0); if (d > dmax) { dmax = d; di = i; } });
+    const before = j[di]?.account || null;
     if (di >= 0) j[di].account = acct;
+    if (explain && before !== acct) explainPush(explain, "INSTRUMENT_RECEIPT", `Receipt instrument set to “${acct}” (mode: ${mode}).`);
   }
 
   return j;
@@ -253,11 +402,10 @@ function isContraJournalShape(journal) {
 }
 function buildContraDocumentFields(journal, existing = {}) {
   const rows = Array.isArray(journal) ? journal : [];
-  const date = rows[0]?.date || new Date().toISOString().slice(0, 10);
+  const date = rows[0]?.date || todayISOInTZ(DEFAULT_TZ);
   const totalDr = rows.reduce((s, l) => s + Number(l?.debit || 0), 0);
   const totalCr = rows.reduce((s, l) => s + Number(l?.credit || 0), 0);
   const amount = R2(Math.max(totalDr, totalCr));
-  // Direction: if Cash gets DR, it's BANK_TO_CASH; if Cash gets CR, it's CASH_TO_BANK.
   const cashDr = rows.some(l => /^cash$/i.test(String(l?.account || "")) && Number(l?.debit || 0) > 0);
   const direction = cashDr ? "BANK_TO_CASH" : "CASH_TO_BANK";
   const prior = (existing && typeof existing === "object") ? (existing.contra_voucher || {}) : {};
@@ -269,7 +417,7 @@ function isPayeeClarification(s) {
 }
 
 /* ========================= Purchase/receipt coercions ========================= */
-function coerceDocTypeForPurchase(docType, documentFields, journal, promptStr = "") {
+function coerceDocTypeForPurchase(docType, documentFields, journal, promptStr = "", explain = null) {
   const j = Array.isArray(journal) ? journal : [];
   const hasSalesOut =
     j.some(l => /sales|revenue|output\s*gst|gst\s*payable/i.test(String(l?.account||"")) && Number(l?.credit||0) > 0);
@@ -293,15 +441,15 @@ function coerceDocTypeForPurchase(docType, documentFields, journal, promptStr = 
   const dateISO =
     (documentFields?.invoice?.date) ||
     (documentFields?.payment_voucher?.date) ||
-    new Date().toISOString().slice(0, 10);
+    todayISOInTZ(DEFAULT_TZ);
 
   const pv = { payee: vendorName, amount: Math.round(totalPaid * 100) / 100, date: dateISO, mode: hasBankCr ? "NEFT" : "cash", purpose: "purchase" };
   const newDF = { ...documentFields, payment_voucher: { ...(documentFields?.payment_voucher || {}), ...pv } };
+  if (explain) explainPush(explain, "COERCE_PURCHASE", `Converted invoice → payment voucher (purchase paid via ${hasBankCr ? "bank" : "cash"}).`);
   return { docType: "payment_voucher", documentFields: newDF };
 }
 
-// Capital/loan inflows: instrument Dr + capital/loan Cr → treat as receipt
-function coerceDocTypeForCapitalOrLoanReceipt(docType, documentFields, journal, promptStr = "") {
+function coerceDocTypeForCapitalOrLoanReceipt(docType, documentFields, journal, promptStr = "", explain = null) {
   const j = Array.isArray(journal) ? journal : [];
   const hasInstrumentDr = j.some(l => looksInstrument(l?.account) && Number(l?.debit || 0) > 0);
   const hasCapitalCr = j.some(l => /capital|share|equity/i.test(String(l?.account || "")) && Number(l?.credit || 0) > 0);
@@ -310,12 +458,13 @@ function coerceDocTypeForCapitalOrLoanReceipt(docType, documentFields, journal, 
   if (!(hasInstrumentDr && (hasCapitalCr || hasLoanCr))) return { docType, documentFields };
 
   const amount = j.reduce((s, l) => s + (looksInstrument(l?.account) ? Number(l?.debit || 0) : 0), 0);
-  const dateISO = (documentFields?.receipt?.date) || (j[0]?.date) || new Date().toISOString().slice(0, 10);
+  const dateISO = (documentFields?.receipt?.date) || (j[0]?.date) || todayISOInTZ(DEFAULT_TZ);
   const payerFromPrompt = (promptStr.match(/director\s+([A-Za-z][^,]*)/)?.[1] || "").trim();
   const payer = payerFromPrompt || (hasCapitalCr ? "Promoter/Owner" : "Lender");
 
   const rcpt = { payer, amount: R2(amount), date: dateISO, mode: "NEFT" };
   const newDF = { ...documentFields, receipt: { ...(documentFields?.receipt || {}), ...rcpt } };
+  if (explain) explainPush(explain, "COERCE_CAPITAL_LOAN", "Converted to receipt (capital/loan inflow to bank/cash).");
   return { docType: "receipt", documentFields: newDF };
 }
 
@@ -375,6 +524,8 @@ function send(res, payload, { debug = false } = {}) {
     if ("fallbackUsed" in payload)      dbg.fallbackUsed = payload.fallbackUsed;
     if ("rawOutput" in payload)         dbg.rawOutput = payload.rawOutput;
     if ("_dev" in payload)              dbg._dev = payload._dev;
+    if ("_explain" in payload)          dbg._explain = payload._explain;
+    if ("_mapping" in payload)          dbg._mapping = payload._mapping;
     out.__debug = dbg;
   }
   return res.status(200).json(out);
@@ -459,27 +610,15 @@ function partitionValidation(validation) {
   const mergedWarnings = warns.concat(softErrors.map(e => ({ ...e, level: "warn" })));
   return { hardErrors, mergedWarnings };
 }
-function extractNewAccountsFromValidation(validation) {
-  const out = new Set();
-  const scan = (arr) => {
-    for (const e of arr || []) {
-      if (e?.code === "LEDGER_MISSING" && e.meta?.account) out.add(String(e.meta.account).trim());
-    }
-  };
-  scan(validation?.errors); scan(validation?.warnings);
-  return Array.from(out);
-}
 function stripLedgerMissing(warnings) {
   return (warnings || []).filter(w => String(w.code) !== "LEDGER_MISSING");
 }
 function fundsClarification(errors) {
   const e = (errors || []).find(x => String(x?.code) === "BANK_CASH_INSUFFICIENT");
   if (!e) return null;
-
   const acctName = String(e?.meta?.account || "").toLowerCase();
   const short = typeof e?.meta?.short_cents === "number" ? (e.meta.short_cents / 100).toFixed(2) : null;
   const date  = e?.meta?.date ? ` as of ${e.meta.date}` : "";
-
   if (/\bcash\b/.test(acctName)) {
     return `Cash is short${date}${short ? ` by ₹${short}` : ""}. Should I book this as an out‑of‑pocket expense to be reimbursed later? If yes, tell me who paid (e.g., “reimburse to Rahul”). If no, say a mode like “use bank” and name the bank if not the default.`;
   }
@@ -543,14 +682,13 @@ function deriveSignalsFromParsed(flow, parsedDocType, parsedFields, clsSignals) 
   if (!s.payee) s.payee = parsedFields.vendor_name || parsedFields.supplier_name || parsedFields.payee || null;
   if (s.amount == null) s.amount = (parsedFields.total_amount ?? parsedFields.amount ?? null);
   if (!s.date) s.date = parsedFields.invoice_date || parsedFields.receipt_date || parsedFields.document_date || parsedFields.date || null;
-  // IMPORTANT: Do NOT fallback from "paid === true" to BANK. Mode must be explicit.
   if (!s.mode) s.mode = stdPayMode(parsedFields.payment_mode || parsedFields.mode || null);
   if (!s.payment_mode && s.mode) s.payment_mode = s.mode;
   if (!s.flow) s.flow = flow || (parsedDocType ? normalizeDocTypeHint(parsedDocType) : null);
   return s;
 }
 
-/* ========================= Raw-text intent helpers ========================= */
+/* ========================= Raw-text helpers ========================= */
 function clipRawText(s, limit = 18000) {
   if (!s || typeof s !== "string") return "";
   const t = s.replace(/\u0000/g, "");
@@ -588,7 +726,7 @@ function buildInferenceContext(rawText, parsedFields) {
 
 /* ========================= Doc model helper ========================= */
 function buildDocModel(docType, documentFields, journal) {
-  const todayISO = new Date().toISOString().slice(0, 10);
+  const todayISO = todayISOInTZ(DEFAULT_TZ);
   const dfByType =
     (documentFields && typeof documentFields === "object")
       ? (docType === "payment_voucher"
@@ -602,11 +740,119 @@ function buildDocModel(docType, documentFields, journal) {
   return dm;
 }
 
+/* ========================= Family-mapping helpers (non-breaking) ========================= */
+const FAMILY_ALLOWED = new Set([
+  "assets.bank","assets.cash","assets.receivables","assets.prepaid","assets.inventory","assets.fixed","assets.contra.accum_depr",
+  "liabilities.payables","liabilities.customer_advances","liabilities.loans",
+  "equity.capital","equity.retained",
+  "income.sales","income.other","income.contra.sales_returns","income.contra.discounts_allowed",
+  "expense.cogs","expense.operating","expense.depreciation","expense.bank_charges","expense.gateway_fees",
+  "tax.gst.input","tax.gst.output","tax.tds.receivable"
+]);
+
+function looksLikeFamilyPayload(inferred) {
+  const lines = inferred?.journal?.lines;
+  return Array.isArray(lines) && lines.length > 0 && typeof lines[0]?.mapping === "object";
+}
+
+function normalizeFamilyMappingToJournal(inferred) {
+  const lines = inferred?.journal?.lines || [];
+  const journal = [];
+  const mappingLines = [];
+
+  for (const ln of lines) {
+    const m = ln?.mapping || {};
+    const fam = String(m.family_code || "");
+    if (!FAMILY_ALLOWED.has(fam)) continue;
+    const amt = Number(ln?.amount || 0) || 0;
+    const isDebit = String(ln?.direction || "").toLowerCase() === "debit";
+    const parent = m.parent_display || null;
+    const child  = m.child_display || null;
+    const account = child || parent || "Misc";
+
+    journal.push({
+      account,
+      debit: isDebit ? R2(amt) : 0,
+      credit: isDebit ? 0 : R2(amt),
+      date: inferred?.journal?.date || null,
+      narration: ln?.narration || ""
+    });
+
+    mappingLines.push({
+      amount: R2(amt),
+      direction: isDebit ? "debit" : "credit",
+      narration: ln?.narration || "",
+      mapping: {
+        family_code: m.family_code,
+        parent_display: parent,
+        child_display: child,
+        type: m.type || null,
+        normal_balance: m.normal_balance || null
+      },
+      tax: ln?.tax || { kind: "none", rate: 0 },
+      rationale: ln?.rationale || ""
+    });
+  }
+
+  return { journal, mappingLines };
+}
+
+/** Materialize mapping → concrete ledgers during PREVIEW (per-tenant; sets family_code when column exists). */
+async function materializeMappingToLedgerLines(mapJournal, sessionId) {
+  if (!mapJournal || !Array.isArray(mapJournal.lines)) {
+    throw new Error("Invalid mapping journal payload.");
+  }
+  const iso = (s) =>
+    (typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s)
+      ? s
+      : todayISOInTZ(DEFAULT_TZ));
+  const defaultDate = iso(mapJournal.date);
+
+  const out = [];
+  for (const line of mapJournal.lines) {
+    const m = line?.mapping || {};
+    const fam = m.family_code;
+    if (!fam) throw new Error("Missing family_code on a mapping line.");
+
+    const parent = m.parent_display && String(m.parent_display).trim() ? String(m.parent_display).trim() : null;
+
+    const child = m.child_display && String(m.child_display).trim() ? String(m.child_display).trim() : null;
+    let ledgerRow;
+    if (child) {
+      ledgerRow = await ensureLedgerExistsWithMapping(child, sessionId, {
+        family_code: fam,
+        type: m.type || null,
+        normal_balance: m.normal_balance || null,
+        source: "llm",
+        rationale: line?.rationale || null,
+        parent_display: parent || null
+      });
+    } else {
+      ledgerRow = await ensureParentForFamily(sessionId, fam, parent || null);
+    }
+
+    const name = ledgerRow?.name || child || parent || fam;
+    const amount = Math.round((Number(line?.amount || 0) || 0) * 100) / 100;
+    if (!(amount > 0)) throw new Error("Invalid amount in mapping line.");
+
+    const dir = String(line?.direction || "").toLowerCase();
+    const date = iso(line?.date) || defaultDate;
+    const narration = (line?.narration || "").toString();
+
+    if (dir === "debit") out.push({ account: name, debit: amount, credit: 0, narration, date });
+    else if (dir === "credit") out.push({ account: name, debit: 0, credit: amount, narration, date });
+    else throw new Error("Mapping line direction must be 'debit' or 'credit'.");
+  }
+  return out;
+}
+
 /* ========================= Exported helper ========================= */
 export const clearOrchestratorSession = (sessionId = "default-session") => { resetMem(sessionId); };
 
 /* ========================= STRUCTURED-DOC FLOW ========================= */
 async function runStructuredDocFlow({ parsedDocType, parsedFields, sessionId, idempotencyKey, debug, rawText }, res) {
+  const explain = [];
+
   const intentProbe = buildIntentProbe(rawText);
   const cls = await classifyPromptType({
     currentPrompt: intentProbe, previousFollowUpChain: [],
@@ -617,11 +863,12 @@ async function runStructuredDocFlow({ parsedDocType, parsedFields, sessionId, id
     return send(res, {
       success: true, status: "followup_needed",
       clarification: "This appears to be an outbound document issued by your own business. The upload parser handles inbound docs only.",
-      docType: "none", promptType: "none", classifier: cls
+      docType: "none", promptType: "none", classifier: cls, _explain: explain
     }, { debug });
   }
 
   const docTypeHint = chooseDocTypeHint(cls, parsedDocType);
+  explainPush(explain, "DOC_TYPE_HINT", `Interpreted document as “${docTypeHint}”.`);
   const hydratedSignals = deriveSignalsFromParsed(cls.flow, parsedDocType, parsedFields, cls.signals);
   const context = buildInferenceContext(rawText, parsedFields);
 
@@ -630,27 +877,59 @@ async function runStructuredDocFlow({ parsedDocType, parsedFields, sessionId, id
   if (!looksContra && (docTypeHint === "payment_voucher" || docTypeHint === "receipt")) {
     const mode = explicitModeFromSignals(parsedFields, rawText);
     if (!mode) {
+      explainPush(explain, "ASK_MODE", "Payment mode not explicit; asking one question.");
       return send(res, {
         success: true, status: "followup_needed",
         clarification: "How was this paid? Choose one: Cash, or Bank (UPI/NEFT/Card). If Bank, you can also say which bank; otherwise I’ll use your default bank.",
-        docType: docTypeHint, promptType: docTypeHint, classifier: cls
+        docType: docTypeHint, promptType: docTypeHint, classifier: cls, _explain: explain
       }, { debug });
     }
   }
 
   const accountantPrompt = buildCanonicalPromptFromSignals(docTypeHint, hydratedSignals, context);
   const inferred = await inferJournalEntriesFromPrompt(accountantPrompt, docTypeHint);
-  const baseJournal = enforceAll(inferred?.journal || [], parsedFields, rawText || "");
 
-  // CONTRA first; else directional instrument placement
-  const { journal: contraJ, applied: contraApplied } =
-    await applyContraIfDetected(baseJournal, sessionId, rawText || "");
-  const finalJournal = contraApplied
-    ? contraJ
-    : await applyDefaultSpendingAccount(baseJournal, parsedFields, sessionId, rawText || "", docTypeHint);
+  let mappingLines = null;
+  let baseJournal = null;
 
-  // Treat as contra if hinted/applied/shape matches
-  const isContraFlow = (docTypeHint === "contra_voucher") || contraApplied || isContraJournalShape(finalJournal);
+  if (looksLikeFamilyPayload(inferred)) {
+    mappingLines = (inferred?.journal?.lines || []).map(ln => ({
+      amount: Math.round((Number(ln?.amount || 0) || 0) * 100) / 100,
+      direction: String(ln?.direction || "").toLowerCase() === "debit" ? "debit" : "credit",
+      narration: ln?.narration || "",
+      mapping: {
+        family_code: ln?.mapping?.family_code || "",
+        parent_display: ln?.mapping?.parent_display || null,
+        child_display: ln?.mapping?.child_display || null,
+        type: ln?.mapping?.type || null,
+        normal_balance: ln?.mapping?.normal_balance || null
+      },
+      tax: ln?.tax || { kind: "none", rate: 0 },
+      rationale: ln?.rationale || ""
+    }));
+
+    const materialized = await materializeMappingToLedgerLines(inferred.journal, sessionId);
+    baseJournal = materialized;
+    explainPush(explain, "MAPPING_USED", `Used family‑code mapping for ${mappingLines.length} line(s).`);
+  } else {
+    const inferredJournal = inferred?.journal || [];
+    baseJournal = enforceAll(inferredJournal, parsedFields, rawText || "", explain);
+  }
+
+  const mappingUsed = Array.isArray(mappingLines) && mappingLines.length > 0;
+  let finalJournal;
+  if (mappingUsed) {
+    finalJournal = baseJournal;
+  } else {
+    const { journal: contraJ, applied: contraApplied } =
+      await applyContraIfDetected(baseJournal, sessionId, rawText || "", explain);
+    finalJournal = contraApplied
+      ? contraJ
+      : await applyDefaultSpendingAccount(baseJournal, parsedFields, sessionId, rawText || "", docTypeHint, explain);
+  }
+
+  const isContraFlow = (docTypeHint === "contra_voucher") || isContraJournalShape(finalJournal);
+  if (isContraFlow) explainPush(explain, "DOC_TYPE_CONTRA", "Classified as contra voucher.");
 
   if (inferred && inferred.status === "followup_needed") {
     let question = inferred.clarification || "Please provide the missing detail.";
@@ -658,20 +937,22 @@ async function runStructuredDocFlow({ parsedDocType, parsedFields, sessionId, id
       question = "For the contra, please confirm the amount, whether it is Bank→Cash or Cash→Bank, and which bank account (or say 'use default bank').";
     }
     return send(res, {
-      success: true, status: "followup_needed", clarification: question,
+      success: true, status: "followup_needed",
+      clarification: question,
       docType: isContraFlow ? "contra_voucher" : (inferred.docType || "none"),
-      promptType: docTypeHint || null, classifier: cls, fallbackUsed: inferred.fallbackUsed
+      promptType: docTypeHint || null, classifier: cls, fallbackUsed: inferred.fallbackUsed,
+      _explain: explain, _mapping: mappingLines
     }, { debug });
   }
   if (!inferred || inferred.status !== "success" || !Array.isArray(finalJournal)) {
     return send(res, {
       success: false, status: inferred?.status || "invalid",
       error: inferred?.message || "Could not infer a valid journal from the extracted fields.",
-      promptType: docTypeHint || null, classifier: cls, fallbackUsed: inferred?.fallbackUsed
+      promptType: docTypeHint || null, classifier: cls, fallbackUsed: inferred?.fallbackUsed,
+      _explain: explain, _mapping: mappingLines
     }, { debug });
   }
 
-  // Coercions (contra; purchase; capital/loan receipts)
   let docType = isContraFlow
     ? "contra_voucher"
     : (typeof inferred.docType === "string" ? inferred.docType : "none");
@@ -680,17 +961,23 @@ async function runStructuredDocFlow({ parsedDocType, parsedFields, sessionId, id
   if (isContraFlow) {
     documentFields = { ...documentFields, ...buildContraDocumentFields(finalJournal, documentFields) };
   } else {
-    ({ docType, documentFields } = coerceDocTypeForPurchase(docType, documentFields, finalJournal, "" /* no NL */));
-    ({ docType, documentFields } = coerceDocTypeForCapitalOrLoanReceipt(docType, documentFields, finalJournal, "" /* no NL */));
+    ({ docType, documentFields } = coerceDocTypeForPurchase(docType, documentFields, finalJournal, "" /* no NL */, explain));
+    ({ docType, documentFields } = coerceDocTypeForCapitalOrLoanReceipt(docType, documentFields, finalJournal, "" /* no NL */, explain));
   }
 
-  const docModel = buildDocModel(docType, documentFields, finalJournal);
+  // Build and normalize the document date (today/relative resolved here)
+  let docModel = buildDocModel(docType, documentFields, finalJournal);
+  docModel.date = await normalizePreviewDate(docModel.date, {
+    text: rawText || "",
+    sessionId,
+    tz: DEFAULT_TZ,
+  });
 
   const validation = await runValidation({
     docType, journal: finalJournal, docModel,
-    tz: "Asia/Kolkata", mode: "preview",
+    tz: DEFAULT_TZ, mode: "preview",
     plannedIdempotencyKey: idempotencyKey || null,
-    sessionId // pass tenant for funds guard
+    sessionId // tenant for funds guard
   });
 
   let { hardErrors, mergedWarnings } = partitionValidation(validation);
@@ -702,17 +989,22 @@ async function runStructuredDocFlow({ parsedDocType, parsedFields, sessionId, id
     return send(res, {
       success: false, status: "invalid",
       errors: hardErrors, warnings: stripLedgerMissing(mergedWarnings),
-      promptType: docTypeHint || null, ...(clar ? { clarification: clar } : {})
+      promptType: docTypeHint || null, ...(clar ? { clarification: clar } : {}),
+      _explain: explain, _mapping: mappingLines
     }, { debug });
   }
 
-  // Auto-create COA for preview (no user friction)
   await ensureAccountsExistForJournalPreview(finalJournal, sessionId);
 
-  const dateISO = docModel?.date || new Date().toISOString().slice(0, 10);
+  const dateISO = docModel?.date || todayISOInTZ(DEFAULT_TZ);
   const reservation = await reserveSeries({ docType, dateISO, previewId: "tmp", sessionId });
 
-  const previewPayload = { docType, docModel: { ...docModel, number: reservation.number }, journal: finalJournal };
+  const previewPayload = {
+    docType,
+    docModel: { ...docModel, number: reservation.number },
+    journal: finalJournal,
+    ...(mappingLines ? { familyMapping: mappingLines } : {}) // stored for audit/next-step rails
+  };
   const snap = await createSnapshot({ docType, payload: previewPayload, reservation, sessionId, userId: null });
 
   try {
@@ -720,14 +1012,17 @@ async function runStructuredDocFlow({ parsedDocType, parsedFields, sessionId, id
   } catch (e) { console.warn("Funds holds creation failed (non-fatal):", e?.message || e); }
 
   const ledgerView = buildLedgerView(finalJournal);
+  const humanExplanation = inferred.explanation || explanationText(explain);
+
   return send(res, {
     success: true, status: "preview",
     previewId: snap.previewId, hash: snap.hash, expiresAt: snap.expiresAt,
     promptType: docTypeHint || null, journal: finalJournal, ledgerView,
-    explanation: inferred.explanation || "Review and confirm the journal.",
+    explanation: humanExplanation,
     newAccounts: [], // created already
     warnings: stripLedgerMissing(mergedWarnings),
-    docType, documentFields, classifier: cls
+    docType, documentFields, classifier: cls,
+    _explain: explain, _mapping: mappingLines
   }, { debug });
 }
 
@@ -770,37 +1065,47 @@ export const orchestratePrompt = async (req, res) => {
     const hasDraft = !!(mem.draft && Array.isArray(mem.draft.journal) && mem.draft.journal.length > 0);
 
     if ((hasEdits || hasDocFieldEdits) && hasDraft) {
+      const explain = [];
       if (hasDocFieldEdits) {
         mem.draft.documentFields = applyDocFieldEdits(mem.draft.documentFields || {}, mem.lastDocType || "none", docFieldEdits);
+        explainPush(explain, "DOC_FIELDS_EDIT", "Applied document field edits.");
       }
       const editedJournal = hasEdits ? applyEdits(mem.draft.journal, edits) : mem.draft.journal;
 
       let docType = mem.lastDocType || "none";
       ({ docType, documentFields: mem.draft.documentFields } =
-        coerceDocTypeForPurchase(docType, mem.draft.documentFields || {}, editedJournal, mem.rootPrompt));
+        coerceDocTypeForPurchase(docType, mem.draft.documentFields || {}, editedJournal, mem.rootPrompt, explain));
       ({ docType, documentFields: mem.draft.documentFields } =
-        coerceDocTypeForCapitalOrLoanReceipt(docType, mem.draft.documentFields || {}, editedJournal, mem.rootPrompt));
+        coerceDocTypeForCapitalOrLoanReceipt(docType, mem.draft.documentFields || {}, editedJournal, mem.rootPrompt, explain));
 
       const fieldsForSpending =
         (docType === "payment_voucher"
           ? (mem.draft.documentFields?.payment_voucher || mem.draft.documentFields?.voucher || {})
           : (mem.draft.documentFields?.[docType] || {})) || {};
 
-      // CONTRA first; else directional instrument placement
       const { journal: contraJ, applied: contraApplied } =
-        await applyContraIfDetected(editedJournal, sid, mem.rootPrompt || "");
+        await applyContraIfDetected(editedJournal, sid, mem.rootPrompt || "", explain);
       const journalWithAccount = contraApplied
         ? contraJ
-        : await applyDefaultSpendingAccount(editedJournal, fieldsForSpending, sid, mem.rootPrompt || "", docType);
+        : await applyDefaultSpendingAccount(editedJournal, fieldsForSpending, sid, mem.rootPrompt || "", docType, explain);
 
       const isContraFlow = contraApplied || isContraJournalShape(journalWithAccount);
-      if (isContraFlow) docType = "contra_voucher";
+      if (isContraFlow) {
+        docType = "contra_voucher";
+        explainPush(explain, "DOC_TYPE_CONTRA", "Classified as contra voucher.");
+      }
 
+      // Build + normalize date (today/relative)
       let docModel = buildDocModel(docType, mem.draft.documentFields, journalWithAccount);
+      docModel.date = await normalizePreviewDate(docModel.date, {
+        text: mem.rootPrompt || "",
+        sessionId: sid,
+        tz: DEFAULT_TZ,
+      });
 
       const validation = await runValidation({
         docType, journal: journalWithAccount, docModel,
-        tz: "Asia/Kolkata", mode: "preview",
+        tz: DEFAULT_TZ, mode: "preview",
         plannedIdempotencyKey: idempotencyKey || null,
         sessionId: sid
       });
@@ -812,13 +1117,14 @@ export const orchestratePrompt = async (req, res) => {
         return send(res, {
           success: false, status: "invalid",
           errors: hardErrors, warnings: stripLedgerMissing(mergedWarnings),
-          promptType: docType, ...(clar ? { clarification: clar } : {})
+          promptType: docType, ...(clar ? { clarification: clar } : {}),
+          _explain: explain
         }, { debug });
       }
 
       await ensureAccountsExistForJournalPreview(journalWithAccount, sid);
 
-      const dateISO = docModel?.date || new Date().toISOString().slice(0, 10);
+      const dateISO = docModel?.date || todayISOInTZ(DEFAULT_TZ);
       const reservation = await reserveSeries({ docType, dateISO, previewId: "tmp", sessionId: sid });
 
       const previewPayload = { docType, docModel: { ...docModel, number: reservation.number }, journal: journalWithAccount };
@@ -837,9 +1143,10 @@ export const orchestratePrompt = async (req, res) => {
         success: true, status: "preview",
         previewId: snap.previewId, hash: snap.hash, expiresAt: snap.expiresAt,
         promptType: docType, journal: journalWithAccount, ledgerView,
-        explanation: "Review and confirm the journal.",
+        explanation: explanationText(explain),
         newAccounts: [], warnings: stripLedgerMissing(mergedWarnings),
         docType, documentFields: mem.draft.documentFields || {},
+        _explain: explain
       }, { debug });
     }
 
@@ -861,6 +1168,7 @@ export const orchestratePrompt = async (req, res) => {
     mem.updatedAt = Date.now();
 
     const combinedPrompt = continuingClarification ? buildCombinedPrompt(mem) : mem.rootPrompt;
+    const explain = [];
 
     const cls = await classifyPromptType({
       currentPrompt: combinedPrompt,
@@ -873,16 +1181,15 @@ export const orchestratePrompt = async (req, res) => {
       return send(res, {
         success: true, status: "followup_needed",
         clarification: "This appears to be an outbound document issued by your own business. The upload parser handles inbound docs only.",
-        docType: "none", promptType: "none", classifier: cls
+        docType: "none", promptType: "none", classifier: cls, _explain: explain
       }, { debug });
     }
 
     const docTypeHint = chooseDocTypeHint(cls, parsedDocType);
+    explainPush(explain, "DOC_TYPE_HINT", `Interpreted document as “${docTypeHint}”.`);
 
-    // ASK-FIRST policy (skip when contra hinted or detected by text)
     const looksContra = (docTypeHint === "contra_voucher") || (detectContraIntent(combinedPrompt || "") !== "NONE");
     if (!looksContra && (docTypeHint === "payment_voucher" || docTypeHint === "receipt")) {
-      // For NL flow, rely on raw text only (don’t trust classifier guesses for mode)
       const mode = explicitModeFromSignals({}, combinedPrompt);
       if (!mode) {
         const q = "How was this paid? Choose one: Cash, or Bank (UPI/NEFT/Card). If Bank, you can also say which bank; otherwise I’ll use your default bank.";
@@ -890,11 +1197,13 @@ export const orchestratePrompt = async (req, res) => {
         mem.lastStatus = "followup_needed";
         mem.lastDocType = docTypeHint;
         mem.updatedAt = Date.now();
+        explainPush(explain, "ASK_MODE", "Payment mode not explicit; asking one question.");
         return send(res, {
           success: true, status: "followup_needed",
           clarification: q,
           docType: docTypeHint, promptType: docTypeHint,
-          classifier: cls, chosenDocTypeHint: docTypeHint
+          classifier: cls, chosenDocTypeHint: docTypeHint,
+          _explain: explain
         }, { debug });
       }
     }
@@ -903,17 +1212,48 @@ export const orchestratePrompt = async (req, res) => {
     const accountantPrompt = buildCanonicalPromptFromSignals(docTypeHint, strongSignals, combinedPrompt);
 
     const inferred = await inferJournalEntriesFromPrompt(accountantPrompt, docTypeHint);
-    const baseJournal = enforceAll(inferred?.journal || [], strongSignals, combinedPrompt || "");
 
-    // CONTRA first; else directional instrument placement
-    const { journal: contraJ, applied: contraApplied } =
-      await applyContraIfDetected(baseJournal, sid, combinedPrompt || "");
-    const finalJournal = contraApplied
-      ? contraJ
-      : await applyDefaultSpendingAccount(baseJournal, strongSignals, sid, combinedPrompt || "", docTypeHint);
+    let mappingLines = null;
+    let baseJournal = null;
 
-    // Decide contra flow (hinted/applied/shape)
-    const isContraFlow = (docTypeHint === "contra_voucher") || contraApplied || isContraJournalShape(finalJournal);
+    if (looksLikeFamilyPayload(inferred)) {
+      mappingLines = (inferred?.journal?.lines || []).map(ln => ({
+        amount: Math.round((Number(ln?.amount || 0) || 0) * 100) / 100,
+        direction: String(ln?.direction || "").toLowerCase() === "debit" ? "debit" : "credit",
+        narration: ln?.narration || "",
+        mapping: {
+          family_code: ln?.mapping?.family_code || "",
+          parent_display: ln?.mapping?.parent_display || null,
+          child_display: ln?.mapping?.child_display || null,
+          type: ln?.mapping?.type || null,
+          normal_balance: ln?.mapping?.normal_balance || null
+        },
+        tax: ln?.tax || { kind: "none", rate: 0 },
+        rationale: ln?.rationale || ""
+      }));
+
+      const materialized = await materializeMappingToLedgerLines(inferred.journal, sid);
+      baseJournal = materialized;
+      explainPush(explain, "MAPPING_USED", `Used family‑code mapping for ${mappingLines.length} line(s).`);
+    } else {
+      const inferredJournal = inferred?.journal || [];
+      baseJournal = enforceAll(inferredJournal, strongSignals, combinedPrompt || "", explain);
+    }
+
+    const mappingUsed = Array.isArray(mappingLines) && mappingLines.length > 0;
+    let finalJournal;
+    if (mappingUsed) {
+      finalJournal = baseJournal;
+    } else {
+      const { journal: contraJ, applied: contraApplied } =
+        await applyContraIfDetected(baseJournal, sid, combinedPrompt || "", explain);
+      finalJournal = contraApplied
+        ? contraJ
+        : await applyDefaultSpendingAccount(baseJournal, strongSignals, sid, combinedPrompt || "", docTypeHint, explain);
+    }
+
+    const isContraFlow = (docTypeHint === "contra_voucher") || isContraJournalShape(finalJournal);
+    if (isContraFlow) explainPush(explain, "DOC_TYPE_CONTRA", "Classified as contra voucher.");
 
     if (inferred && inferred.status === "followup_needed") {
       let question = inferred.clarification || "Please provide the missing detail.";
@@ -929,7 +1269,8 @@ export const orchestratePrompt = async (req, res) => {
         success: true, status: "followup_needed",
         clarification: question,
         docType: mem.lastDocType || "none", promptType: docTypeHint || null,
-        classifier: cls, fallbackUsed: inferred.fallbackUsed, chosenDocTypeHint: docTypeHint
+        classifier: cls, fallbackUsed: inferred.fallbackUsed, chosenDocTypeHint: docTypeHint,
+        _explain: explain, _mapping: mappingLines
       }, { debug });
     }
 
@@ -938,7 +1279,8 @@ export const orchestratePrompt = async (req, res) => {
       return send(res, {
         success: false, status: inferred?.status || "invalid",
         error: inferred?.message || "Could not infer a valid journal from the prompt.",
-        promptType: docTypeHint || null, classifier: cls, fallbackUsed: inferred?.fallbackUsed, chosenDocTypeHint: docTypeHint
+        promptType: docTypeHint || null, classifier: cls, fallbackUsed: inferred?.fallbackUsed, chosenDocTypeHint: docTypeHint,
+        _explain: explain, _mapping: mappingLines
       }, { debug });
     }
 
@@ -953,16 +1295,22 @@ export const orchestratePrompt = async (req, res) => {
       documentFields = { ...documentFields, ...buildContraDocumentFields(finalJournal, documentFields) };
     } else {
       ({ docType, documentFields } =
-        coerceDocTypeForPurchase(docType, documentFields, finalJournal, mem.rootPrompt || prompt));
+        coerceDocTypeForPurchase(docType, documentFields, finalJournal, mem.rootPrompt || prompt, explain));
       ({ docType, documentFields } =
-        coerceDocTypeForCapitalOrLoanReceipt(docType, documentFields, finalJournal, mem.rootPrompt || prompt));
+        coerceDocTypeForCapitalOrLoanReceipt(docType, documentFields, finalJournal, mem.rootPrompt || prompt, explain));
     }
 
-    const docModel = buildDocModel(docType, documentFields, finalJournal);
+    // Build + normalize date (today/relative)
+    let docModel = buildDocModel(docType, documentFields, finalJournal);
+    docModel.date = await normalizePreviewDate(docModel.date, {
+      text: combinedPrompt || "",
+      sessionId: sid,
+      tz: DEFAULT_TZ,
+    });
 
     const validation = await runValidation({
       docType, journal: finalJournal, docModel,
-      tz: "Asia/Kolkata", mode: "preview",
+      tz: DEFAULT_TZ, mode: "preview",
       plannedIdempotencyKey: idempotencyKey || null,
       sessionId: sid
     });
@@ -977,16 +1325,22 @@ export const orchestratePrompt = async (req, res) => {
       return send(res, {
         success: false, status: "invalid",
         errors: hardErrors, warnings: stripLedgerMissing(mergedWarnings),
-        promptType: docTypeHint || null, ...(clar ? { clarification: clar } : {})
+        promptType: docTypeHint || null, ...(clar ? { clarification: clar } : {}),
+        _explain: explain, _mapping: mappingLines
       }, { debug });
     }
 
     await ensureAccountsExistForJournalPreview(finalJournal, sid);
 
-    const dateISO = docModel?.date || new Date().toISOString().slice(0, 10);
+    const dateISO = docModel?.date || todayISOInTZ(DEFAULT_TZ);
     const reservation = await reserveSeries({ docType, dateISO, previewId: "tmp", sessionId: sid });
 
-    const previewPayload = { docType, docModel: { ...docModel, number: reservation.number }, journal: finalJournal };
+    const previewPayload = {
+      docType,
+      docModel: { ...docModel, number: reservation.number },
+      journal: finalJournal,
+      ...(mappingLines ? { familyMapping: mappingLines } : {})
+    };
     const snap = await createSnapshot({ docType, payload: previewPayload, reservation, sessionId: sid, userId: req.body?.userId || null });
 
     try {
@@ -1004,10 +1358,11 @@ export const orchestratePrompt = async (req, res) => {
       success: true, status: "preview",
       previewId: snap.previewId, hash: snap.hash, expiresAt: snap.expiresAt,
       promptType: docTypeHint || null, journal: finalJournal, ledgerView,
-      explanation: inferred.explanation || "Review and confirm the journal.",
+      explanation: inferred.explanation || explanationText(explain),
       newAccounts: [], warnings: stripLedgerMissing(mergedWarnings),
       docType: mem.lastDocType || "none", documentFields: mem.draft.documentFields || {},
-      classifier: cls, chosenDocTypeHint: docTypeHint
+      classifier: cls, chosenDocTypeHint: docTypeHint,
+      _explain: explain, _mapping: mappingLines
     }, { debug });
 
   } catch (err) {

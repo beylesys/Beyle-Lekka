@@ -21,6 +21,18 @@ import {
 } from "../controllers/bankReconciliation.js";
 import { tenantStub } from "../middleware/tenant.js"; // <-- correct relative path
 
+// NEW: brand‑agnostic Import/Export controllers
+import {
+  upload as uploadImport,
+  startImport,
+  getBatch,
+  setProfile,
+  previewImport,
+  commitImport,
+  downloadTemplate
+} from "../controllers/importsController.js";
+import { exportData } from "../controllers/exportsController.js";
+
 const router = express.Router();
 
 // Mount tenant middleware for all /api routes
@@ -51,5 +63,32 @@ router.post("/documents/upload", uploadDocs.single("file"), uploadAndExtract);
 router.post("/bankreco/import",      uploadBankCSV.single("file"), importBankCSV);
 router.get ("/bankreco/suggestions", suggestions);
 router.post("/bankreco/match",       confirmMatch);
+
+/* ------------------------------------------------------------------ */
+/*                         IMPORT / EXPORT (GENERIC)                   */
+/* ------------------------------------------------------------------ */
+
+// Import (brand‑agnostic):
+// 1) Upload a file (xlsx/csv/json)
+router.post("/import/upload", uploadImport.single("file"), startImport);
+
+// 2) Batch status & suggested profile
+router.get("/import/batches/:id", getBatch);
+
+// 3) Override/confirm detected profile
+router.post("/import/batches/:id/profile", setProfile);
+
+// 4) Parse & stage (preview)
+router.get("/import/batches/:id/preview", previewImport);
+
+// 5) Commit to ledger (atomic + idempotent)
+router.post("/import/batches/:id/commit", commitImport);
+
+// 6) Download blank templates per profile
+router.get("/import/templates/:profile", downloadTemplate);
+
+// Export (brand‑agnostic):
+// GET /api/export?profile=<id>&from=YYYY-MM-DD&to=YYYY-MM-DD
+router.get("/export", exportData);
 
 export default router;

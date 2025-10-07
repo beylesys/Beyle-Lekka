@@ -10,69 +10,138 @@ const currencySymbol = "₹";
 
 const today = new Date().toISOString().split("T")[0]; // e.g., 2025-06-07
 
-// ------------------------ SYSTEM INSTRUCTIONS (revised, inbound-only) ------------------------
+/* ============================================================================================
+   Family-code mapping (catalog-free rails) — preferred output shape
+   ============================================================================================ */
+const ALLOWED_FAMILY_CODES = [
+  "assets.bank",
+  "assets.cash",
+  "assets.receivables",
+  "assets.prepaid",
+  "assets.inventory",
+  "assets.fixed",
+  "assets.contra.accum_depr",
+  "liabilities.payables",
+  "liabilities.customer_advances",
+  "liabilities.loans",
+  "equity.capital",
+  "equity.retained",
+  "income.sales",
+  "income.other",
+  "income.contra.sales_returns",
+  "income.contra.discounts_allowed",
+  "expense.cogs",
+  "expense.operating",
+  "expense.depreciation",
+  "expense.bank_charges",
+  "expense.gateway_fees",
+  "tax.gst.input",
+  "tax.gst.output",
+  "tax.tds.receivable"
+];
+
+/* ============================================================================================
+   SYSTEM INSTRUCTIONS
+   - Inbound-only; strict JSON; family-code mapping preferred with a safe legacy fallback.
+   ============================================================================================ */
 const SYSTEM_INSTRUCTIONS = `
 Assume today's system date is ${today}. Convert relative or partial dates like "yesterday", "6th June", or "today" into full YYYY-MM-DD using this reference date.
 
 You are the in-house accountant assisting the user in maintaining the financial books of their own business (any legal entity). Classify and post double-entry journals that comply with Indian Accounting Standards (Ind AS) and universally accepted accounting heads.
 
-You ALSO extract document fields for a business document when the prompt implies one (INBOUND ONLY):
-- Supported doc types (inbound): "invoice" (meaning vendor/purchase invoice only), "receipt" (receipt issued by others acknowledging our inward money), "payment_voucher" (our outward payment record). If none applies, use "none".
-- Do NOT create outbound documents (our own sales invoices / outward delivery notes) here; those are created by the system elsewhere. If the prompt describes our own invoice issuance or an outbound doc, set docType:"none".
+INBOUND-ONLY SCOPE:
+- Supported doc types (inbound): "invoice" (vendor/purchase only), "receipt" (money we received from others), "payment_voucher" (our outward payment). If none applies, use "none".
+- DO NOT create outbound docs (our own sales invoice/outbound delivery notes). If the prompt is outbound, set docType:"none" and ask a single clarifying question if needed.
 
-- For "invoice" (vendor), capture: buyer, date (YYYY-MM-DD), items[{name, qty, rate, amount(optional)}], paymentMode, taxes(optional), narration(optional), totalAmount(optional).
-- For "receipt", capture: receivedFrom, amount, date (YYYY-MM-DD), mode, towards(optional), narration(optional).
-- For "payment_voucher", capture: payee(optional), amount, date (YYYY-MM-DD), mode, purpose(optional), narration(optional).
+STRICT RULES:
+1) Return structured data only. Never include chain-of-thought or any commentary outside the JSON fields.
+2) Never invent unknown values. If a critical detail is missing or ambiguous (date, amount, counterparty/buyer/receivedFrom, payment mode, invoice items), return status "followup_needed" with ONE concise clarification instead of posting a journal.
+   Exception: For everyday expenses (electricity, water, telecom, internet, fuel, petrol/diesel, tolls, parking, subscriptions, bank charges, petty cash, ride-hailing), if the user gives date+amount+mode and no payee, DO NOT ask "paid who?" — leave payee empty and proceed.
+3) For any posted journal:
+   - Each line must have: date (YYYY-MM-DD), either debit>0 XOR credit>0 (not both), and non-empty account or mapping.
+   - Zero-value lines are not allowed. Totals must balance to two decimals.
+4) Do not assume default cash/bank/vendor/customer; infer only if explicit.
 
-RULES (STRICT):
-1) Return structured data only. Do not include chain-of-thought, explanations, or commentary outside the structured fields.
-2) Never invent unknown values. If a critical detail for JE or for the document is missing or ambiguous (date, amount, counterparty/buyer/receivedFrom, payment mode, or invoice items), request ONE concise clarification instead of posting a journal.
-   Exception: For everyday expenses (electricity, water, telecom, internet, fuel, petrol/diesel, tolls, parking, subscriptions, bank charges, petty cash, ride-hailing), if user gives date+amount+mode and does not name a payee, DO NOT ask "paid who?" — leave payee empty and proceed.
-3) Required for any posted journal:
-   - Each line must include: date (YYYY-MM-DD), account (string), debit (number >= 0), credit (number >= 0).
-   - For each line, exactly one of {debit, credit} must be > 0 (XOR). Zero-value lines are not allowed.
-   - Total debits must equal total credits (after normalization to two decimals).
-4) Do not assume default cash/bank/vendor/customer; infer from the prompt only if explicit.
-5) Dates must be normalized per the system date above.
-6) Output format is controlled by the caller via tool input schema (for Claude) or JSON mode (for fallbacks). Follow it exactly.
+PREFERRED RESPONSE (FAMILY-CODE MAPPING):
+- Use a small, universal "family_code" enumeration to classify each line.
+- Allowed family_code values (choose from this list ONLY): ${ALLOWED_FAMILY_CODES.join(", ")}.
+- For each line, provide mapping { family_code, parent_display, child_display, type, normal_balance } and optional tax { kind, rate } and a short "rationale".
+- Do NOT invent new families. If you are unsure between two families, ask ONE concise clarification (status "followup_needed").
 
-RESPONSE MODES:
-- SUCCESS: Provide a balanced journal (array of lines), a short layman "explanation", the "docType" in {"invoice","receipt","payment_voucher","none"}, and "documentFields" for that docType (or docType:"none" with empty fields if no doc should be created).
-- FOLLOWUP_NEEDED: Provide a single "clarification" string explaining precisely what is missing. If known, also return the inferred "docType".
+LEGACY FALLBACK (when mapping is not feasible):
+- Return a balanced journal as an array of lines with {account,debit,credit,date[,narration]}.
+
+DOCUMENT FIELDS:
+- Always include "docType": one of {"invoice","receipt","payment_voucher","none"}.
+- For "invoice" (vendor), capture: buyer, date (YYYY-MM-DD), items[{name,qty,rate,amount(optional)}], paymentMode, taxes(optional), narration(optional), totalAmount(optional).
+- For "receipt": receivedFrom, amount, date (YYYY-MM-DD), mode, towards(optional), narration(optional).
+- For "payment_voucher": amount, date (YYYY-MM-DD), mode, payee(optional), purpose(optional), narration(optional).
 
 IMPORTANT:
-- Do not output anything other than the structured JSON.
+- Output ONLY JSON matching the tool schema. No markdown fences. No prose outside the JSON.
 `;
 
-// ------------------------ Tool / JSON Schema used for Claude -------------------
-const OUTPUT_SCHEMA = {
+/* ============================================================================================
+   TOOL SCHEMAS
+   - Mapping-first tool (preferred)
+   - Legacy tool (existing shape)
+   ============================================================================================ */
+
+// Family-mapping (preferred) schema
+const MAPPING_OUTPUT_SCHEMA = {
   type: "object",
   additionalProperties: false,
   properties: {
     status: { type: "string", enum: ["success", "followup_needed"] },
-
-    // When status === "success"
+    // When status === "success" (mapping shape)
     journal: {
-      type: "array",
-      minItems: 2,
-      items: {
-        type: "object",
-        additionalProperties: false,
-        required: ["account", "debit", "credit", "date"],
-        properties: {
-          account: { type: "string", minLength: 1, maxLength: 128 },
-          debit: { type: "number", minimum: 0 },
-          credit: { type: "number", minimum: 0 },
-          narration: { type: "string", maxLength: 512 },
-          date: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" }
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        date: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" },
+        currency: { type: "string", default: "INR" },
+        lines: {
+          type: "array",
+          minItems: 2,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              narration: { type: "string" },
+              amount: { type: "number", minimum: 0 },
+              direction: { type: "string", enum: ["debit", "credit"] },
+              date: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" },
+              mapping: {
+                type: "object",
+                additionalProperties: false,
+                required: ["family_code"],
+                properties: {
+                  family_code: { type: "string", enum: ALLOWED_FAMILY_CODES },
+                  parent_display: { type: ["string", "null"] },
+                  child_display: { type: ["string", "null"] },
+                  type: { type: ["string", "null"], enum: [null,"asset","liability","equity","income","expense","contra_asset","contra_income"] },
+                  normal_balance: { type: ["string", "null"], enum: [null,"debit","credit"] }
+                }
+              },
+              tax: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  kind: { type: "string", enum: ["none","gst_input","gst_output","rcm"] },
+                  rate: { type: "number", minimum: 0 }
+                },
+                required: ["kind","rate"]
+              },
+              rationale: { type: "string" }
+            },
+            required: ["amount","direction","mapping","date"]
+          }
         }
-      }
+      },
+      required: ["date", "lines"]
     },
     explanation: { type: "string" },
-
-    // Document extraction (always include docType; use "none" when no doc should be generated)
-    docType: { type: "string", enum: ["invoice", "receipt", "payment_voucher", "none"] },
-
+    docType: { type: "string", enum: ["invoice","receipt","payment_voucher","none"] },
     documentFields: {
       type: "object",
       additionalProperties: false,
@@ -80,7 +149,7 @@ const OUTPUT_SCHEMA = {
         invoice: {
           type: "object",
           additionalProperties: false,
-          required: ["buyer", "date", "items", "paymentMode"],
+          required: ["buyer","date","items","paymentMode"],
           properties: {
             buyer: { type: "string", minLength: 1 },
             date: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" },
@@ -90,7 +159,7 @@ const OUTPUT_SCHEMA = {
               items: {
                 type: "object",
                 additionalProperties: false,
-                required: ["name", "qty", "rate"],
+                required: ["name","qty","rate"],
                 properties: {
                   name: { type: "string", minLength: 1 },
                   qty: { type: "number", minimum: 0 },
@@ -108,7 +177,7 @@ const OUTPUT_SCHEMA = {
         receipt: {
           type: "object",
           additionalProperties: false,
-          required: ["receivedFrom", "amount", "date", "mode"],
+          required: ["receivedFrom","amount","date","mode"],
           properties: {
             receivedFrom: { type: "string", minLength: 1 },
             amount: { type: "number", minimum: 0 },
@@ -121,8 +190,97 @@ const OUTPUT_SCHEMA = {
         payment_voucher: {
           type: "object",
           additionalProperties: false,
-          // NOTE: payee is OPTIONAL to avoid the "Paid who?" loop on everyday expenses
-          required: ["amount", "date", "mode"],
+          required: ["amount","date","mode"],
+          properties: {
+            payee: { type: "string" },
+            amount: { type: "number", minimum: 0 },
+            date: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" },
+            mode: { type: "string", minLength: 1 },
+            purpose: { type: "string" },
+            narration: { type: "string" }
+          }
+        }
+      }
+    },
+    // When status === "followup_needed"
+    clarification: { type: "string" }
+  },
+  required: ["status","docType"]
+};
+
+// Legacy output schema (your current shape)
+const LEGACY_OUTPUT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    status: { type: "string", enum: ["success", "followup_needed"] },
+    journal: {
+      type: "array",
+      minItems: 2,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["account", "debit", "credit", "date"],
+        properties: {
+          account: { type: "string", minLength: 1, maxLength: 128 },
+          debit: { type: "number", minimum: 0 },
+          credit: { type: "number", minimum: 0 },
+          narration: { type: "string", maxLength: 512 },
+          date: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" }
+        }
+      }
+    },
+    explanation: { type: "string" },
+    docType: { type: "string", enum: ["invoice", "receipt", "payment_voucher", "none"] },
+    documentFields: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        invoice: {
+          type: "object",
+          additionalProperties: false,
+          required: ["buyer","date","items","paymentMode"],
+          properties: {
+            buyer: { type: "string", minLength: 1 },
+            date: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" },
+            items: {
+              type: "array",
+              minItems: 1,
+              items: {
+                type: "object",
+                additionalProperties: false,
+                required: ["name","qty","rate"],
+                properties: {
+                  name: { type: "string", minLength: 1 },
+                  qty: { type: "number", minimum: 0 },
+                  rate: { type: "number", minimum: 0 },
+                  amount: { type: "number", minimum: 0 }
+                }
+              }
+            },
+            paymentMode: { type: "string", minLength: 1 },
+            taxes: { type: "number" },
+            narration: { type: "string" },
+            totalAmount: { type: "number" }
+          }
+        },
+        receipt: {
+          type: "object",
+          additionalProperties: false,
+          required: ["receivedFrom","amount","date","mode"],
+          properties: {
+            receivedFrom: { type: "string", minLength: 1 },
+            amount: { type: "number", minimum: 0 },
+            date: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" },
+            mode: { type: "string", minLength: 1 },
+            towards: { type: "string" },
+            narration: { type: "string" }
+          }
+        },
+        payment_voucher: {
+          type: "object",
+          additionalProperties: false,
+          required: ["amount","date","mode"],
           properties: {
             payee: { type: "string", minLength: 1 },
             amount: { type: "number", minimum: 0 },
@@ -134,19 +292,18 @@ const OUTPUT_SCHEMA = {
         }
       }
     },
-
-    // When status === "followup_needed"
     clarification: { type: "string" }
   },
-  required: ["status", "docType"]
+  required: ["status","docType"]
 };
 
-// ------------------------ Helpers: normalization & validation ------------------
+/* ============================================================================================
+   Helpers (legacy normalization used only for legacy fallback)
+   ============================================================================================ */
 const isYYYYMMDD = (s) => typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
 
 const toCents = (n) => {
   if (typeof n === "string") {
-    // Accept common numeric strings like "1,500.00" or "₹1,500.00"
     const cleaned = n.replace(/[^\d.-]/g, "");
     const parsed = Number.parseFloat(cleaned);
     if (!Number.isFinite(parsed)) return null;
@@ -194,7 +351,6 @@ function normalizeJournal(journal) {
 
   if (normalized.length < 2) errors.push("journal:min_2_lines");
 
-  // Balance check in cents
   const totalDebitCents = normalized.reduce((s, r) => s + toCents(r.debit), 0);
   const totalCreditCents = normalized.reduce((s, r) => s + toCents(r.credit), 0);
   if (totalDebitCents !== totalCreditCents) {
@@ -204,42 +360,22 @@ function normalizeJournal(journal) {
   return { ok: errors.length === 0, errors, warnings, normalized };
 }
 
-function buildLedgerView(rows) {
-  // | Date | Account | Debit | Credit | Narration |
-  const header = `Date | Account | Debit | Credit | Narration`;
-  const sep = `---- | ------- | ----- | ------ | ---------`;
-  const lines = rows.map(r =>
-    `${r.date} | ${r.account} | ${r.debit.toFixed(2)} | ${r.credit.toFixed(2)} | ${r.narration || ""}`
-  );
-  return [header, sep, ...lines].join("\n");
+/* ============================================================================================
+   Utilities
+   ============================================================================================ */
+function pickMappingToolUse(blocks) {
+  return (blocks || []).find((b) => b?.type === "tool_use" && b?.name === "produce_family_mapping");
+}
+function pickLegacyToolUse(blocks) {
+  return (blocks || []).find((b) => b?.type === "tool_use" && b?.name === "produce_legacy_output");
+}
+function looksLikeFamilyPayload(candidate) {
+  return candidate && candidate.journal && Array.isArray(candidate.journal.lines);
 }
 
-// Minimal sanitizer for document fields (do NOT invent; just tidy)
-function sanitizeDocumentFields(docType, documentFields) {
-  if (!docType || docType === "none" || !documentFields) return {};
-  const df = documentFields[docType] || null;
-  if (!df) return {};
-
-  // Compute item.amount if qty & rate present and amount missing (light-touch, not invention)
-  if (docType === "invoice" && Array.isArray(df.items)) {
-    df.items = df.items.map(it => {
-      const out = { ...it };
-      if (typeof out.amount !== "number" && typeof out.qty === "number" && typeof out.rate === "number") {
-        out.amount = twoDp(out.qty * out.rate);
-      }
-      return out;
-    });
-  }
-
-  // Make payee an explicit empty string when omitted (for UI nicety)
-  if (docType === "payment_voucher" && (df.payee == null)) {
-    df.payee = "";
-  }
-
-  return { [docType]: df };
-}
-
-// ------------------------ Main: Inference with guardrails ----------------------
+/* ============================================================================================
+   Main: Inference with mapping-first, safe legacy fallback
+   ============================================================================================ */
 export const inferJournalEntriesFromPrompt = async (userPrompt, promptType = "") => {
   let usedFallback = null;
 
@@ -250,33 +386,35 @@ User Prompt:
 Caller Hint (may be empty): docType="${promptType || "none"}"
 
 TASK:
-1) INBOUND ONLY — If all critical info for BOTH the journal and the document (if applicable) is present, output status "success" with:
-   - a balanced journal
-   - a short layman explanation
-   - docType in {"invoice","receipt","payment_voucher","none"} where "invoice" == vendor/purchase invoice only
-   - documentFields keyed by that docType (or empty if "none")
-2) If anything critical is missing/ambiguous (date, amount, counterparty, payment mode, invoice items), output status "followup_needed" with ONE concise clarification question. If you can infer the docType from the user prompt, include that docType; otherwise "none".
+1) Prefer FAMILY-CODE mapping output. If you can classify lines into families confidently, return the mapping shape.
+2) If any critical detail is missing/ambiguous (date, amount, counterparty, payment mode, invoice items), return status "followup_needed" with ONE concise clarification and, if known, the inferred docType.
+3) If mapping is not feasible, return the legacy balanced journal shape. 
 `.trim();
 
-  console.log("Running inference → Claude primary (tool/schema), GPT fallback (JSON mode), OpenRouter secondary fallback");
+  console.log("Running inference → Claude mapping-first (tool/schema), legacy Claude fallback, GPT JSON fallback, OpenRouter fallback");
 
-  // ---------- Claude PRIMARY (forced tool-use with input_schema) ----------
-  const claudePromise = axios.post(
+  /* ---------- Claude PRIMARY: mapping-first (forced mapping tool) ---------- */
+  const claudeMappingPromise = axios.post(
     "https://api.anthropic.com/v1/messages",
     {
-      model: "claude-3-opus-20240229",
+      model: process.env.CLAUDE_MODEL || "claude-3-opus-20240229",
       max_tokens: 1200,
       temperature: 0,
       system: SYSTEM_INSTRUCTIONS,
       messages: [{ role: "user", content: fullPrompt }],
       tools: [
         {
-          name: "produce_output",
-          description: "Return ONLY structured output matching the schema. Never include explanations outside the fields.",
-          input_schema: OUTPUT_SCHEMA
+          name: "produce_family_mapping",
+          description: "Return ONLY structured output matching the mapping schema. Prefer this when feasible.",
+          input_schema: MAPPING_OUTPUT_SCHEMA
+        },
+        {
+          name: "produce_legacy_output",
+          description: "Return ONLY structured output matching the legacy schema (use only if mapping cannot be done).",
+          input_schema: LEGACY_OUTPUT_SCHEMA
         }
       ],
-      tool_choice: { type: "tool", name: "produce_output" }
+      tool_choice: { type: "tool", name: "produce_family_mapping" }
     },
     {
       headers: {
@@ -287,9 +425,43 @@ TASK:
     }
   );
 
-  // ---------- OpenAI FALLBACK (JSON mode + seed) ----------
+  // If mapping fails or not provided, we call legacy tool explicitly.
+  const callClaudeLegacy = async () => {
+    try {
+      const res = await axios.post(
+        "https://api.anthropic.com/v1/messages",
+        {
+          model: process.env.CLAUDE_MODEL || "claude-3-opus-20240229",
+          max_tokens: 1000,
+          temperature: 0,
+          system: SYSTEM_INSTRUCTIONS,
+          messages: [{ role: "user", content: fullPrompt }],
+          tools: [
+            { name: "produce_legacy_output", description: "Legacy journal output.", input_schema: LEGACY_OUTPUT_SCHEMA }
+          ],
+          tool_choice: { type: "tool", name: "produce_legacy_output" }
+        },
+        {
+          headers: {
+            "x-api-key": process.env.CLAUDE_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json"
+          }
+        }
+      );
+      const blocks = res?.data?.content || [];
+      const tu = pickLegacyToolUse(blocks);
+      if (tu?.input) return tu.input;
+      return null;
+    } catch (err) {
+      console.error("Claude legacy call failed:", err?.message || err);
+      return null;
+    }
+  };
+
+  // ---------- OpenAI GPT FALLBACK (JSON mode) ----------
   const gptPromise = openai.chat.completions.create({
-    model: "gpt-4-1106-preview",
+    model: process.env.OPENAI_FALLBACK_MODEL || "gpt-4-1106-preview",
     temperature: 0,
     top_p: 1,
     seed: 42,
@@ -298,7 +470,17 @@ TASK:
       { role: "system", content: SYSTEM_INSTRUCTIONS },
       {
         role: "user",
-        content: `${fullPrompt}\n\nReturn ONLY a JSON object with keys: status, journal (if success), explanation (if success), docType, documentFields, clarification (if followup_needed).`
+        content:
+          `${fullPrompt}\n\n` +
+          `Prefer the mapping shape. If not feasible, return legacy.\n` +
+          `Return ONLY a JSON object with:\n` +
+          `- status ("success"|"followup_needed")\n` +
+          `- EITHER journal:{date,currency,lines:[{narration,amount,direction,date,mapping:{family_code,parent_display,child_display,type,normal_balance},tax:{kind,rate},rationale}...]}\n` +
+          `- OR journal:[{account,debit,credit,date(,narration)}...]\n` +
+          `- explanation (if success)\n` +
+          `- docType\n` +
+          `- documentFields keyed by docType\n` +
+          `- clarification (if followup_needed)`
       }
     ]
   });
@@ -309,13 +491,14 @@ TASK:
       const res = await axios.post(
         "https://openrouter.ai/api/v1/chat/completions",
         {
-          model: "mistral/mixtral-8x7b-instruct",
+          model: process.env.OPENROUTER_MODEL || "mistral/mixtral-8x7b-instruct",
           messages: [
             { role: "system", content: SYSTEM_INSTRUCTIONS },
             {
               role: "user",
               content:
-                `${fullPrompt}\n\nReturn ONLY a JSON object with keys: status, journal (if success), explanation (if success), docType, documentFields, clarification (if followup_needed). No markdown fences.`
+                `${fullPrompt}\n\n` +
+                `Prefer mapping; else legacy. Return ONLY a JSON object, no markdown fences.`
             }
           ],
           temperature: 0
@@ -335,39 +518,39 @@ TASK:
   };
 
   try {
-    const [claudeRes, gptRes] = await Promise.allSettled([claudePromise, gptPromise]);
+    const claudeRes = await claudeMappingPromise;
 
-    // Prefer Claude tool result
     let candidate = null;
 
-    if (claudeRes.status === "fulfilled") {
-      const blocks = claudeRes.value?.data?.content || [];
-      const toolUse = blocks.find((b) => b?.type === "tool_use" && b?.name === "produce_output");
-      if (toolUse?.input) {
-        candidate = toolUse.input;
-        console.log("Claude (tool) JSON received.");
-      } else {
-        console.warn("Claude fulfilled but no tool_use content; falling back.");
-      }
+    // 1) Try Claude mapping tool_use first
+    const blocks = claudeRes?.data?.content || [];
+    const mapTU = pickMappingToolUse(blocks);
+    if (mapTU?.input) {
+      candidate = mapTU.input;
+      console.log("Claude mapping JSON received.");
     } else {
-      console.error("Claude error:", claudeRes.reason?.message || "unknown");
+      console.warn("Claude mapping fulfilled but no mapping tool_use; trying Claude legacy tool.");
+      candidate = await callClaudeLegacy();
+      if (candidate) {
+        usedFallback = "claude_legacy";
+        console.log("Claude legacy JSON received.");
+      }
     }
 
-    // If no Claude JSON, try OpenAI JSON mode
-    if (!candidate && gptRes.status === "fulfilled") {
+    // 2) If no Claude result, try GPT
+    if (!candidate) {
+      const gptRes = await gptPromise;
       try {
-        const txt = gptRes.value?.choices?.[0]?.message?.content?.trim() || "";
+        const txt = gptRes?.choices?.[0]?.message?.content?.trim() || "";
         candidate = txt ? JSON.parse(txt) : null;
         usedFallback = "gpt";
         console.log("GPT (JSON mode) JSON received.");
       } catch (e) {
         console.warn("GPT JSON parse failed:", e.message);
       }
-    } else if (!candidate && gptRes.status !== "fulfilled") {
-      console.error("GPT error:", gptRes.reason?.message || "unknown");
     }
 
-    // If still nothing, use OpenRouter string and parse
+    // 3) If still nothing, try OpenRouter (parse JSON from text)
     if (!candidate) {
       const openRouterRaw = await getOpenRouterFallback();
       if (openRouterRaw) {
@@ -378,7 +561,7 @@ TASK:
         try {
           candidate = JSON.parse(jsonRaw);
           console.log("OpenRouter JSON parsed.");
-        } catch (e) {
+        } catch {
           console.warn("OpenRouter JSON parse failed.");
         }
       }
@@ -388,18 +571,16 @@ TASK:
       throw new Error("All models failed to produce structured JSON.");
     }
 
-    // FOLLOWUP short-circuit
+    // FOLLOWUP path (both mapping & legacy)
     if (String(candidate.status).toLowerCase() === "followup_needed") {
       const clarification =
-        (candidate && typeof candidate.clarification === "string" && candidate.clarification.trim()) ||
+        (typeof candidate.clarification === "string" && candidate.clarification.trim()) ||
         "Please provide the missing date, amount, counterparty/buyer/receivedFrom, payment mode, or invoice items.";
       const docType =
         (typeof candidate.docType === "string" && ["invoice","receipt","payment_voucher","none"].includes(candidate.docType))
           ? candidate.docType
           : (promptType && ["invoice","receipt","payment_voucher"].includes(promptType) ? promptType : "none");
 
-      // Inbound-only enforcement: if model guessed an outbound sales invoice, do not force "invoice"
-      // (light guard — we rely primarily on SYSTEM_INSTRUCTIONS)
       return {
         status: "followup_needed",
         clarification,
@@ -408,10 +589,36 @@ TASK:
       };
     }
 
-    // SUCCESS path: validate & normalize JE, include doc info
+    // SUCCESS path
+    // If it's mapping shape, return as-is (or with minimal cleanup).
+    if (looksLikeFamilyPayload(candidate)) {
+      // Ensure minimal fields exist
+      const explanation =
+        (typeof candidate.explanation === "string" && candidate.explanation.trim()) ||
+        "Mapped each line to a standard family; debits and credits balance.";
+      let docType = (typeof candidate.docType === "string" && ["invoice","receipt","payment_voucher","none"].includes(candidate.docType))
+        ? candidate.docType
+        : (["invoice","receipt","payment_voucher"].includes(promptType) ? promptType : "none");
+
+      const documentFields =
+        candidate && candidate.documentFields && typeof candidate.documentFields === "object"
+          ? candidate.documentFields
+          : {};
+
+      // Do not touch candidate.journal.lines; orchestrator will validate, normalize and explain.
+      return {
+        status: "success",
+        journal: candidate.journal,   // { date, currency, lines: [...] with mapping }
+        explanation,
+        docType,
+        documentFields,
+        fallbackUsed: usedFallback
+      };
+    }
+
+    // Else, handle legacy shape: normalize & return legacy result
     const rawJournal = Array.isArray(candidate.journal) ? candidate.journal : [];
     const norm = normalizeJournal(rawJournal);
-
     if (!norm.ok) {
       return {
         status: "fallback_to_manual",
@@ -421,34 +628,28 @@ TASK:
       };
     }
 
-    // Derive docType with hint fallback
     let docType = (typeof candidate.docType === "string" && ["invoice","receipt","payment_voucher","none"].includes(candidate.docType))
       ? candidate.docType
       : "none";
-
     if (docType === "none" && ["invoice","receipt","payment_voucher"].includes(promptType)) {
       docType = promptType;
     }
 
-    // Sanitize documentFields minimally (no invention)
     const documentFields =
       candidate && candidate.documentFields && typeof candidate.documentFields === "object"
-        ? sanitizeDocumentFields(docType, candidate.documentFields)
+        ? candidate.documentFields
         : {};
 
-    // Build ledgerView from normalized rows (consistent formatting)
-    const ledgerView = buildLedgerView(norm.normalized);
     const explanation =
       (typeof candidate.explanation === "string" && candidate.explanation.trim()) ||
       "Transaction recorded as a balanced double-entry.";
 
     return {
       status: "success",
-      journal: norm.normalized,
-      ledgerView,
+      journal: norm.normalized, // legacy shape; orchestrator handles this path too
       explanation,
-      docType,                  // "invoice" | "receipt" | "payment_voucher" | "none"
-      documentFields,           // { invoice|receipt|payment_voucher: {...} } or {}
+      docType,
+      documentFields,
       fallbackUsed: usedFallback
     };
   } catch (err) {

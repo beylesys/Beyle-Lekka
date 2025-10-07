@@ -29,15 +29,16 @@ function computeAbsoluteBase(rawInput) {
   }
   path = path.replace(/\/+$/, "");
 
-  const origin = (typeof window !== "undefined" && window.location && window.location.origin)
-    ? window.location.origin
-    : "http://localhost";
+  const origin =
+    typeof window !== "undefined" && window.location && window.location.origin
+      ? window.location.origin
+      : "http://localhost";
   const abs = new URL(path || DEFAULT_PREFIX, origin);
   return abs.toString();
 }
 
 /** Base URL resolution (localStorage override → env → sensible defaults) */
-const computedDefault = (import.meta?.env?.DEV ? "http://localhost:3000/api" : "/api");
+const computedDefault = import.meta?.env?.DEV ? "http://localhost:3000/api" : "/api";
 const rawBase =
   (typeof localStorage !== "undefined" && localStorage.getItem("apiBaseUrl")) ||
   import.meta.env.VITE_API_BASE_URL ||
@@ -48,12 +49,18 @@ export const BASE_URL = computeAbsoluteBase(rawBase);
 /** Runtime override helpers for base URL (handy in QA) */
 export function setApiBaseUrl(urlOrPath) {
   const abs = computeAbsoluteBase(urlOrPath);
-  try { localStorage.setItem("apiBaseUrl", abs); } catch {}
+  try {
+    localStorage.setItem("apiBaseUrl", abs);
+  } catch {}
   api.defaults.baseURL = abs;
   return abs;
 }
 export function getApiBaseUrl() {
-  try { return localStorage.getItem("apiBaseUrl") || BASE_URL; } catch { return BASE_URL; }
+  try {
+    return localStorage.getItem("apiBaseUrl") || BASE_URL;
+  } catch {
+    return BASE_URL;
+  }
 }
 
 // One-time log in dev to confirm what we're using
@@ -96,9 +103,10 @@ export function setAdminKey(k) {
   } catch {}
 }
 
+/** Axios instance */
 const api = axios.create({
   baseURL: BASE_URL,
-  timeout: 20000,
+  timeout: 60000,
 });
 
 /**
@@ -108,20 +116,15 @@ const api = axios.create({
  * - Auto-inject X-Admin-Key for /api/admin/* when available.
  */
 api.interceptors.request.use((config) => {
-  const h = (config.headers || {});
-  const explicit =
-    h["X-Workspace-Id"] || h["x-workspace-id"] || h["X-workspace-id"] || null;
+  const h = config.headers || {};
+  const explicit = h["X-Workspace-Id"] || h["x-workspace-id"] || h["X-workspace-id"] || null;
 
   // Try to detect from body/params when present
-  const fromData =
-    (config.data && typeof config.data === "object" && config.data.sessionId) || null;
-  const fromParams =
-    (config.params && typeof config.params === "object" && config.params.sessionId) || null;
+  const fromData = config.data && typeof config.data === "object" && config.data.sessionId ? config.data.sessionId : null;
+  const fromParams = config.params && typeof config.params === "object" && config.params.sessionId ? config.params.sessionId : null;
 
   const sid = explicit || fromData || fromParams || getWorkspaceId() || DEFAULT_WORKSPACE_ID;
-  if (sid) {
-    h["X-Workspace-Id"] = sid; // "ALL" is acceptable for read-only endpoints
-  }
+  if (sid) h["X-Workspace-Id"] = sid; // "ALL" is acceptable for read-only endpoints
 
   // Auto-attach admin key for admin routes
   const urlPath = String(config.url || "");
@@ -144,6 +147,7 @@ api.interceptors.response.use(
   }
 );
 
+/** Small helper for common GET/POST flows */
 function handle(method, url, data, config) {
   const cfg = { ...(config || {}) };
   if (method === "get") {
@@ -152,12 +156,17 @@ function handle(method, url, data, config) {
   return api[method](url, data, cfg).then((r) => r.data);
 }
 
+/** Generate a basic idempotency key */
 export function makeIdemKey(seed = "") {
   const ts = Date.now();
   const rnd = Math.random().toString(36).slice(2, 8);
   const s = (seed || "").toString().slice(0, 64);
   return `idem_${ts}_${rnd}_${s}`;
 }
+
+/* -----------------------------------------------------------------------------
+ *                               CORE FEATURES
+ * ---------------------------------------------------------------------------*/
 
 /**
  * Orchestrate — supports BOTH modes:
@@ -192,8 +201,7 @@ export async function orchestratePrompt(params = {}) {
   // Detect structured mode
   const hasFields = fields && typeof fields === "object" && Object.keys(fields).length > 0;
   const structuredMode =
-    source === "extraction" || hasFields ||
-    (docFieldEdits && docType && typeof docFieldEdits === "object");
+    source === "extraction" || hasFields || (docFieldEdits && docType && typeof docFieldEdits === "object");
 
   const payload = { sessionId };
 
@@ -206,8 +214,7 @@ export async function orchestratePrompt(params = {}) {
     if (debug !== undefined) payload.debug = debug; // keep body flag too
     if (meta !== undefined) payload.meta = meta;
     payload.idempotencyKey =
-      idempotencyKey ||
-      makeIdemKey(`${docType || "doc"}:${JSON.stringify(fields || {}).slice(0, 128)}`);
+      idempotencyKey || makeIdemKey(`${docType || "doc"}:${JSON.stringify(fields || {}).slice(0, 128)}`);
     return handle("post", "/orchestratePrompt", payload, cfg);
   }
 
@@ -242,12 +249,7 @@ export async function orchestrateFromExtraction({
 }
 
 /** Confirm a preview snapshot produced by orchestrate (needs previewId and hash). */
-export async function confirmFromPreview({
-  previewId,
-  hash,
-  sessionId = getWorkspaceId(),
-  idempotencyKey,
-}) {
+export async function confirmFromPreview({ previewId, hash, sessionId = getWorkspaceId(), idempotencyKey }) {
   if (!previewId || !hash) throw new Error("previewId and hash are required");
   return handle("post", "/confirmAndSaveEntry", {
     previewId,
@@ -261,20 +263,18 @@ export async function confirmFromPreview({
 export const confirmEntry = (payload) => handle("post", "/confirmAndSaveEntry", payload);
 
 /** Ledger view (DB-backed on server) */
-export const fetchLedgerView = (sessionId = getWorkspaceId()) =>
-  handle("post", "/getLedgerView", { sessionId });
+export const fetchLedgerView = (sessionId = getWorkspaceId()) => handle("post", "/getLedgerView", { sessionId });
 
 /** Update a single ledger entry (inline edit) */
 export const updateLedgerEntry = (payload) => handle("post", "/ledger/update", payload);
 
 /** Optional memory getter (if exposed) */
-export const getMemoryBySession = (sessionId = getWorkspaceId()) =>
-  handle("post", "/getMemory", { sessionId });
+export const getMemoryBySession = (sessionId = getWorkspaceId()) => handle("post", "/getMemory", { sessionId });
 
 /** Server-side reports (GET) — header carries the workspace automatically */
-export const getTrialBalance  = (asOf)        => handle("get", "/reports/trial-balance", { asOf });
-export const getPL            = (from, to)    => handle("get", "/reports/pl",            { from, to });
-export const getBalanceSheet  = (asOf)        => handle("get", "/reports/bs",            { asOf });
+export const getTrialBalance = (asOf) => handle("get", "/reports/trial-balance", { asOf });
+export const getPL = (from, to) => handle("get", "/reports/pl", { from, to });
+export const getBalanceSheet = (asOf) => handle("get", "/reports/bs", { asOf });
 
 /** Document upload + extraction */
 export async function uploadDocument(file, opts = {}) {
@@ -291,7 +291,10 @@ export async function uploadDocument(file, opts = {}) {
     .then((r) => r.data);
 }
 
-/** Bank reconciliation */
+/* -----------------------------------------------------------------------------
+ *                               BANK RECONCILIATION
+ * ---------------------------------------------------------------------------*/
+
 export async function importBankCSV(file, bankAccountId) {
   if (!bankAccountId) throw new Error("bankAccountId is required");
   const fd = new FormData();
@@ -305,7 +308,98 @@ export const fetchRecoSuggestions = (params) => handle("get", "/bankreco/suggest
 export const confirmRecoMatch = (bankLineId, ledgerEntryId) =>
   handle("post", "/bankreco/match", { bankLineId, ledgerEntryId });
 
-/** Admin helpers (optional, but nice to have in dev tools) */
+/* -----------------------------------------------------------------------------
+ *                          IMPORT / EXPORT (BRAND‑AGNOSTIC)
+ * ---------------------------------------------------------------------------*/
+
+/** Upload a file to start an import batch */
+export async function importUpload(file) {
+  if (!file) throw new Error("File is required");
+  const fd = new FormData();
+  fd.append("file", file);
+  return api
+    .post("/import/upload", fd, { headers: { "Content-Type": "multipart/form-data" } })
+    .then((r) => r.data);
+}
+
+/** Get batch status */
+export const importGetBatch = (batchId) => {
+  if (!batchId) throw new Error("batchId is required");
+  return handle("get", `/import/batches/${batchId}`);
+};
+
+/** Set/override detected profile */
+export const importSetProfile = (batchId, profileId) => {
+  if (!batchId) throw new Error("batchId is required");
+  if (!profileId) throw new Error("profileId is required");
+  return handle("post", `/import/batches/${batchId}/profile`, { profileId });
+};
+
+/** Preview (parse & stage) */
+export const importPreview = (batchId) => {
+  if (!batchId) throw new Error("batchId is required");
+  return handle("get", `/import/batches/${batchId}/preview`);
+};
+
+/** Commit (post to ledger) */
+export const importCommit = (batchId) => {
+  if (!batchId) throw new Error("batchId is required");
+  return handle("post", `/import/batches/${batchId}/commit`, {});
+};
+
+/** Common helpers for binary downloads */
+function filenameFromDisposition(h) {
+  if (!h) return null;
+  const v = String(h);
+  // RFC 5987 and basic filename=
+  const m =
+    v.match(/filename\*?=(?:UTF-8''|")?([^;"']+)/i) ||
+    v.match(/filename="?([^"]+)"?/i);
+  return m ? decodeURIComponent(m[1].replace(/["']/g, "")) : null;
+}
+function saveBlobToDisk(data, fallbackName = "download.bin", contentType) {
+  const blob = new Blob([data], { type: contentType || "application/octet-stream" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = fallbackName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+/** Download a blank template for a given profile */
+export async function downloadTemplate(profileId) {
+  if (!profileId) throw new Error("profileId is required");
+  const res = await api.get(`/import/templates/${profileId}`, { responseType: "blob" });
+  const fname =
+    filenameFromDisposition(res.headers?.["content-disposition"]) || `${profileId}.template`;
+  saveBlobToDisk(res.data, fname, res.headers?.["content-type"]);
+  return true;
+}
+
+/** Export data (streams a file; returns true on success, false on 204) */
+export async function exportDownload(profileId, from, to) {
+  if (!profileId) throw new Error("profileId is required");
+  if (!from || !to) throw new Error("from and to are required (YYYY-MM-DD)");
+  const res = await api.get("/export", {
+    params: { profile: profileId, from, to },
+    responseType: "blob",
+    validateStatus: (s) => [200, 204].includes(s),
+  });
+  if (res.status === 204) return false;
+  const fname =
+    filenameFromDisposition(res.headers?.["content-disposition"]) ||
+    `${profileId}-${from}_to_${to}`;
+  saveBlobToDisk(res.data, fname, res.headers?.["content-type"]);
+  return true;
+}
+
+/* -----------------------------------------------------------------------------
+ *                                  ADMIN
+ * ---------------------------------------------------------------------------*/
+
 export const admin = {
   listSessions() {
     return api.get("/admin/sessions").then((r) => r.data);

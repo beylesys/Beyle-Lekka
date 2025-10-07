@@ -1,6 +1,24 @@
 ﻿// utils/coaService.js
 // Enhanced: multi-tenant aware (session_id), Postgres-ready column detection,
-// preserves existing functionality (canonicalization, seeding, dedupe, parent-child creation).
+// preserves existing functionality (canonicalization, seeding, dedupe, parent-child creation)
+// and adds family-code anchored helpers for mapping rails.
+// Spec alignment: Catalog-Free, Family-Code Anchored CoA Mapping + Pilot Plan gates.
+
+/*
+  This module implements:
+  - Baseline CoA seeding and canonicalization (idempotent, tenant-aware)
+  - Safe lookups and normalized name matching (SQLite/PG friendly)
+  - Parent–child creation for AR/AP and party-ledgers
+  - Family-code rails:
+      ensureParentForFamily(sessionId, family_code)
+      ensureLedgerExistsWithMapping(child_display, sessionId, opts)
+    …with invariants on type/normal_balance and optional party enforcement
+  - Indexes for integrity and performance (case-insensitive uniqueness per tenant)
+
+  References:
+  - Catalog‑Free, Family‑Code Anchored CoA Mapping (design spec).  <-- keeps LLM outputs on rails
+  - Pilot Plan: Scope, Sequence & Acceptance (green‑only posting, idempotency, observability)
+*/
 
 import { query } from "../services/db.js";
 
@@ -101,7 +119,7 @@ const BASE_COA = [
   ["7110", "TDS Payable (194J)", "liability", "credit"],
 ];
 
-/* ----------------- detection helpers (SQLite now; PG-ready later) ----------------- */
+/* ----------------- detection helpers (SQLite + PG) ----------------- */
 
 function safeIdent(t) {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(String(t || ""))) throw new Error(`Invalid identifier: ${t}`);
@@ -142,6 +160,9 @@ async function detectCoaCols() {
     hasNormalBalance: names.includes("normal_balance"),
     hasIsActive:      names.includes("is_active"),
     hasParentCode:    names.includes("parent_code"),
+    hasFamilyCode:    names.includes("family_code"),
+    hasSource:        names.includes("source"),
+    hasRationale:     names.includes("rationale"),
   };
 }
 
@@ -290,7 +311,7 @@ async function lookupByNormalizedName(name, sid = null) {
     if (sid) {
       // Prefer tenant; fallback to GLOBAL in a single ordered query
       const q = await query(
-        `SELECT account_code, name, session_id
+        `SELECT account_code, name, session_id, type, normal_balance, parent_code, family_code
            FROM chart_of_accounts
           WHERE (session_id = $1 OR session_id = 'GLOBAL')
             AND (is_active = 1 OR is_active IS NULL)
@@ -304,7 +325,7 @@ async function lookupByNormalizedName(name, sid = null) {
 
       // As a last resort, scan (handles minor whitespace/dash diffs)
       const scan = await query(
-        `SELECT account_code, name, session_id
+        `SELECT account_code, name, session_id, type, normal_balance, parent_code, family_code
            FROM chart_of_accounts
           WHERE (session_id = $1 OR session_id = 'GLOBAL')
             AND (is_active = 1 OR is_active IS NULL)`,
@@ -318,7 +339,7 @@ async function lookupByNormalizedName(name, sid = null) {
 
     // No SID provided but sessionized table => admin/ALL scope should only look at GLOBAL
     const q = await query(
-      `SELECT account_code, name
+      `SELECT account_code, name, type, normal_balance, parent_code, family_code
          FROM chart_of_accounts
         WHERE session_id = 'GLOBAL' AND (is_active = 1 OR is_active IS NULL) AND LOWER(name) = LOWER($1)
         LIMIT 1`,
@@ -327,7 +348,7 @@ async function lookupByNormalizedName(name, sid = null) {
     if (q.rows?.length) return q.rows[0];
 
     const scan = await query(
-      `SELECT account_code, name
+      `SELECT account_code, name, type, normal_balance, parent_code, family_code
          FROM chart_of_accounts
         WHERE session_id = 'GLOBAL' AND (is_active = 1 OR is_active IS NULL)`
     );
@@ -339,7 +360,7 @@ async function lookupByNormalizedName(name, sid = null) {
 
   // Legacy (no session_id column): search globally
   const q = await query(
-    `SELECT account_code, name
+    `SELECT account_code, name, type, normal_balance, parent_code, family_code
        FROM chart_of_accounts
       WHERE (is_active = 1 OR is_active IS NULL)
         AND LOWER(name) = LOWER($1)
@@ -349,7 +370,7 @@ async function lookupByNormalizedName(name, sid = null) {
   if (q.rows?.length) return q.rows[0];
 
   const { rows } = await query(
-    `SELECT account_code, name
+    `SELECT account_code, name, type, normal_balance, parent_code, family_code
        FROM chart_of_accounts
       WHERE (is_active = 1 OR is_active IS NULL)`
   );
@@ -384,13 +405,14 @@ export async function ensureBaseCoA() {
     console.warn("⚠️ Could not ensure 'parent_code' column:", e?.message || e);
   }
 
-  // If session_id already exists (post-migration), we keep seeding GLOBAL scope
+  // Add family_code/source/rationale for mapping rails
+  try { await query(`ALTER TABLE chart_of_accounts ADD COLUMN family_code TEXT`); } catch {}
+  try { await query(`ALTER TABLE chart_of_accounts ADD COLUMN source TEXT`); } catch {}
+  try { await query(`ALTER TABLE chart_of_accounts ADD COLUMN rationale TEXT`); } catch {}
+
   const hasSid = await tableHasColumn("chart_of_accounts", "session_id");
 
-  // --- Deduplicate legacy data so unique indexes (or future constraints) are safe ---
-  // These steps are best-effort and wrapped in try/catch for cross-dialect safety.
-
-  // 1) Fix duplicate account_code values (keep first, reassign others)
+  // --- Deduplicate legacy data so unique indexes are safe (best-effort, cross-dialect guarded) ---
   try {
     const dups = await query(`
       SELECT account_code, COUNT(*) AS c
@@ -405,7 +427,7 @@ export async function ensureBaseCoA() {
         [code]
       );
       const all = rows.rows || [];
-      for (let i = 1; i < all.length; i++) { // skip the first row (keep it)
+      for (let i = 1; i < all.length; i++) {
         const newCode = await nextFreeCode();
         await query(
           `UPDATE chart_of_accounts SET account_code = $1 WHERE rowid = $2`,
@@ -414,10 +436,9 @@ export async function ensureBaseCoA() {
       }
     }
   } catch (e) {
-    console.warn("⚠️ Could not dedupe duplicate account_code:", e?.message || e);
+    console.warn("⚠️ dedupe(account_code) skipped:", e?.message || e);
   }
 
-  // 2) Fix duplicate names (keep first, rename others: "Name (2)", "Name (3)", ...)
   try {
     const dups = await query(`
       SELECT name, COUNT(*) AS c
@@ -434,7 +455,6 @@ export async function ensureBaseCoA() {
       const all = rows.rows || [];
       let suffix = 2;
       for (let i = 1; i < all.length; i++) {
-        // find a free new name
         let newName;
         while (true) {
           newName = `${base} (${suffix++})`;
@@ -451,39 +471,63 @@ export async function ensureBaseCoA() {
       }
     }
   } catch (e) {
-    console.warn("⚠️ Could not dedupe duplicate names:", e?.message || e);
+    console.warn("⚠️ dedupe(name) skipped:", e?.message || e);
   }
 
-  // 3) Ensure helpful indexes (keep current semantics; uniqueness handled by schema)
+  // Helpful indexes
   try {
     await query(`CREATE INDEX IF NOT EXISTS ix_coa_name ON chart_of_accounts(name)`);
     await query(`CREATE INDEX IF NOT EXISTS ix_coa_code ON chart_of_accounts(account_code)`);
+    // family rails
+    await query(`CREATE INDEX IF NOT EXISTS idx_coa_family ON chart_of_accounts(family_code)`);
     if (hasSid) {
       await query(`CREATE INDEX IF NOT EXISTS ix_coa_sid_name ON chart_of_accounts(session_id, name)`);
       await query(`CREATE INDEX IF NOT EXISTS ix_coa_sid_code ON chart_of_accounts(session_id, account_code)`);
+      await query(`CREATE INDEX IF NOT EXISTS idx_coa_sid_family ON chart_of_accounts(session_id, family_code)`);
+      // Case-insensitive uniqueness per tenant (works on PG & recent SQLite)
+      await query(`CREATE UNIQUE INDEX IF NOT EXISTS ux_coa_sid_name ON chart_of_accounts(session_id, lower(name))`);
     }
   } catch (e) {
     console.warn("⚠️ Could not ensure indexes on chart_of_accounts:", e?.message || e);
   }
 
-  // 4) Seed baseline rows — insert as global rows if session_id exists, else as legacy rows
+  // Seed baseline rows — insert as GLOBAL rows if session_id exists, else as legacy rows
   for (const [code, name, type, normal] of BASE_COA) {
     if (hasSid) {
-      await query(
-        `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, session_id)
-         VALUES ($1,$2,$3,$4,1,'GLOBAL')`,
-        [code, name, type, normal]
-      );
+      // Try PG form then SQLite form
+      try {
+        await query(
+          `INSERT INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, session_id)
+           VALUES ($1,$2,$3,$4,1,'GLOBAL')
+           ON CONFLICT (account_code) DO NOTHING`,
+          [code, name, type, normal]
+        );
+      } catch {
+        await query(
+          `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, session_id)
+           VALUES ($1,$2,$3,$4,1,'GLOBAL')`,
+          [code, name, type, normal]
+        );
+      }
     } else {
-      await query(
-        `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active)
-         VALUES ($1,$2,$3,$4,1)`,
-        [code, name, type, normal]
-      );
+      try {
+        await query(
+          `INSERT INTO chart_of_accounts (account_code, name, type, normal_balance, is_active)
+           VALUES ($1,$2,$3,$4,1)
+           ON CONFLICT (account_code) DO NOTHING`,
+          [code, name, type, normal]
+        );
+      } catch {
+        await query(
+          `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active)
+           VALUES ($1,$2,$3,$4,1)`,
+          [code, name, type, normal]
+        );
+      }
     }
   }
 
-  // 5) Canonicalization sweep (now per-tenant if session_id exists)
+  // Canonicalization sweep (per-tenant if sessionized)
   await canonicalizeExistingData();
 }
 
@@ -545,24 +589,50 @@ export async function ensureLedgerExists(nameOrCode, sidOrHint = undefined, mayb
       const pcode  = await nextFreeCode();
 
       if (hasSidCol && sid) {
-        await query(
-          `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, parent_code, session_id)
-           VALUES ($1,$2,$3,$4,1,NULL,$5)`,
-          [pcode, parent, type, normal, sid]
-        );
+        try {
+          await query(
+            `INSERT INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, parent_code, session_id)
+             VALUES ($1,$2,$3,$4,1,NULL,$5)
+             ON CONFLICT (account_code) DO NOTHING`,
+            [pcode, parent, type, normal, sid]
+          );
+        } catch {
+          await query(
+            `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, parent_code, session_id)
+             VALUES ($1,$2,$3,$4,1,NULL,$5)`,
+            [pcode, parent, type, normal, sid]
+          );
+        }
       } else if (hasSidCol && !sid) {
-        // if session_id col exists but no sid provided, seed into GLOBAL scope
-        await query(
-          `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, parent_code, session_id)
-           VALUES ($1,$2,$3,$4,1,NULL,'GLOBAL')`,
-          [pcode, parent, type, normal]
-        );
+        try {
+          await query(
+            `INSERT INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, parent_code, session_id)
+             VALUES ($1,$2,$3,$4,1,NULL,'GLOBAL')
+             ON CONFLICT (account_code) DO NOTHING`,
+            [pcode, parent, type, normal]
+          );
+        } catch {
+          await query(
+            `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, parent_code, session_id)
+             VALUES ($1,$2,$3,$4,1,NULL,'GLOBAL')`,
+            [pcode, parent, type, normal]
+          );
+        }
       } else {
-        await query(
-          `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, parent_code)
-           VALUES ($1,$2,$3,$4,1,NULL)`,
-          [pcode, parent, type, normal]
-        );
+        try {
+          await query(
+            `INSERT INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, parent_code)
+             VALUES ($1,$2,$3,$4,1,NULL)
+             ON CONFLICT (account_code) DO NOTHING`,
+            [pcode, parent, type, normal]
+          );
+        } catch {
+          await query(
+            `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, parent_code)
+             VALUES ($1,$2,$3,$4,1,NULL)`,
+            [pcode, parent, type, normal]
+          );
+        }
       }
       p = await lookupByNormalizedName(parent, hasSidCol ? sid : null);
     }
@@ -570,23 +640,50 @@ export async function ensureLedgerExists(nameOrCode, sidOrHint = undefined, mayb
     const code = await nextFreeCode();
     const fullName = `${p.name} - ${child}`;
     if (hasSidCol && sid) {
-      await query(
-        `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, parent_code, session_id)
-         VALUES ($1,$2,$3,$4,1,$5,$6)`,
-        [code, fullName, p.type || "asset", p.normal_balance || (p.type === "asset" ? "debit" : "credit"), p.account_code, sid]
-      );
+      try {
+        await query(
+          `INSERT INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, parent_code, session_id)
+           VALUES ($1,$2,$3,$4,1,$5,$6)
+           ON CONFLICT (account_code) DO NOTHING`,
+          [code, fullName, p.type || "asset", p.normal_balance || (p.type === "asset" ? "debit" : "credit"), p.account_code, sid]
+        );
+      } catch {
+        await query(
+          `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, parent_code, session_id)
+           VALUES ($1,$2,$3,$4,1,$5,$6)`,
+          [code, fullName, p.type || "asset", p.normal_balance || (p.type === "asset" ? "debit" : "credit"), p.account_code, sid]
+        );
+      }
     } else if (hasSidCol && !sid) {
-      await query(
-        `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, parent_code, session_id)
-         VALUES ($1,$2,$3,$4,1,$5,'GLOBAL')`,
-        [code, fullName, p.type || "asset", p.normal_balance || (p.type === "asset" ? "debit" : "credit"), p.account_code]
-      );
+      try {
+        await query(
+          `INSERT INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, parent_code, session_id)
+           VALUES ($1,$2,$3,$4,1,$5,'GLOBAL')
+           ON CONFLICT (account_code) DO NOTHING`,
+          [code, fullName, p.type || "asset", p.normal_balance || (p.type === "asset" ? "debit" : "credit"), p.account_code]
+        );
+      } catch {
+        await query(
+          `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, parent_code, session_id)
+           VALUES ($1,$2,$3,$4,1,$5,'GLOBAL')`,
+          [code, fullName, p.type || "asset", p.normal_balance || (p.type === "asset" ? "debit" : "credit"), p.account_code]
+        );
+      }
     } else {
-      await query(
-        `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, parent_code)
-         VALUES ($1,$2,$3,$4,1,$5)`,
-        [code, fullName, p.type || "asset", p.normal_balance || (p.type === "asset" ? "debit" : "credit"), p.account_code]
-      );
+      try {
+        await query(
+          `INSERT INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, parent_code)
+           VALUES ($1,$2,$3,$4,1,$5)
+           ON CONFLICT (account_code) DO NOTHING`,
+          [code, fullName, p.type || "asset", p.normal_balance || (p.type === "asset" ? "debit" : "credit"), p.account_code]
+        );
+      } catch {
+        await query(
+          `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, parent_code)
+           VALUES ($1,$2,$3,$4,1,$5)`,
+          [code, fullName, p.type || "asset", p.normal_balance || (p.type === "asset" ? "debit" : "credit"), p.account_code]
+        );
+      }
     }
 
     const check = await lookupByNormalizedName(fullName, hasSidCol ? sid : null);
@@ -610,27 +707,55 @@ export async function ensureLedgerExists(nameOrCode, sidOrHint = undefined, mayb
   if (typeof hint.debit === "boolean") normal = hint.debit ? "debit" : "credit";
 
   const code = await nextFreeCode();
-  if (hasSidCol && sid) {
-    await query(
-      `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, session_id)
-       VALUES ($1,$2,$3,$4,1,$5)`,
-      [code, nameCanon, type, normal, sid]
-    );
-  } else if (hasSidCol && !sid) {
-    await query(
-      `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, session_id)
-       VALUES ($1,$2,$3,$4,1,'GLOBAL')`,
-      [code, nameCanon, type, normal]
-    );
+  const hasSidCol2 = await tableHasColumn("chart_of_accounts", "session_id");
+  if (hasSidCol2 && sid) {
+    try {
+      await query(
+        `INSERT INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, session_id)
+         VALUES ($1,$2,$3,$4,1,$5)
+         ON CONFLICT (account_code) DO NOTHING`,
+        [code, nameCanon, type, normal, sid]
+      );
+    } catch {
+      await query(
+        `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, session_id)
+         VALUES ($1,$2,$3,$4,1,$5)`,
+        [code, nameCanon, type, normal, sid]
+      );
+    }
+  } else if (hasSidCol2 && !sid) {
+    try {
+      await query(
+        `INSERT INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, session_id)
+         VALUES ($1,$2,$3,$4,1,'GLOBAL')
+         ON CONFLICT (account_code) DO NOTHING`,
+        [code, nameCanon, type, normal]
+      );
+    } catch {
+      await query(
+        `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active, session_id)
+         VALUES ($1,$2,$3,$4,1,'GLOBAL')`,
+        [code, nameCanon, type, normal]
+      );
+    }
   } else {
-    await query(
-      `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active)
-       VALUES ($1,$2,$3,$4,1)`,
-      [code, nameCanon, type, normal]
-    );
+    try {
+      await query(
+        `INSERT INTO chart_of_accounts (account_code, name, type, normal_balance, is_active)
+         VALUES ($1,$2,$3,$4,1)
+         ON CONFLICT (account_code) DO NOTHING`,
+        [code, nameCanon, type, normal]
+      );
+    } catch {
+      await query(
+        `INSERT OR IGNORE INTO chart_of_accounts (account_code, name, type, normal_balance, is_active)
+         VALUES ($1,$2,$3,$4,1)`,
+        [code, nameCanon, type, normal]
+      );
+    }
   }
 
-  const check = await lookupByNormalizedName(nameCanon, hasSidCol ? sid : null);
+  const check = await lookupByNormalizedName(nameCanon, hasSidCol2 ? sid : null);
   return check?.account_code || code;
 }
 
@@ -732,6 +857,229 @@ export async function canonicalizeExistingData() {
       [oldName]
     );
   }
+}
+
+/* ============================================================================================
+   Family-code mapping rails (catalog-free, per design spec)
+   ============================================================================================ */
+
+const FAMILY_META = {
+  "assets.bank":                     { parentName: "Bank",                                  type: "asset",     normal: "debit",  partyRequired: false },
+  "assets.cash":                     { parentName: "Cash",                                  type: "asset",     normal: "debit",  partyRequired: false },
+  "assets.receivables":              { parentName: "Debtors (Accounts Receivable)",         type: "asset",     normal: "debit",  partyRequired: true  },
+  "assets.prepaid":                  { parentName: "Prepaid Expenses",                      type: "asset",     normal: "debit",  partyRequired: false },
+  "assets.inventory":                { parentName: "Inventory",                             type: "asset",     normal: "debit",  partyRequired: false },
+  "assets.fixed":                    { parentName: "Fixed Assets",                          type: "asset",     normal: "debit",  partyRequired: false },
+  "assets.contra.accum_depr":        { parentName: "Accumulated Depreciation",              type: "asset",     normal: "credit", partyRequired: false },
+
+  "liabilities.payables":            { parentName: "Creditors (Accounts Payable)",          type: "liability", normal: "credit", partyRequired: true  },
+  "liabilities.customer_advances":   { parentName: "Unearned Revenue (Advances from Customers)", type: "liability", normal: "credit", partyRequired: true  },
+  "liabilities.loans":               { parentName: "Loans",                                 type: "liability", normal: "credit", partyRequired: false },
+
+  "equity.capital":                  { parentName: "Capital Account",                       type: "equity",    normal: "credit", partyRequired: false },
+  "equity.retained":                 { parentName: "Reserves & Surplus",                    type: "equity",    normal: "credit", partyRequired: false },
+
+  "income.sales":                    { parentName: "Sales",                                 type: "income",    normal: "credit", partyRequired: false },
+  "income.other":                    { parentName: "Other Operating Income",                type: "income",    normal: "credit", partyRequired: false },
+  "income.contra.sales_returns":     { parentName: "Sales Returns",                         type: "income",    normal: "debit",  partyRequired: false },
+  "income.contra.discounts_allowed": { parentName: "Discount Allowed",                      type: "income",    normal: "debit",  partyRequired: false },
+
+  "expense.cogs":                    { parentName: "Cost of Goods Sold",                    type: "expense",   normal: "debit",  partyRequired: false },
+  "expense.operating":               { parentName: "Office Expenses",                       type: "expense",   normal: "debit",  partyRequired: false },
+  "expense.depreciation":            { parentName: "Depreciation Expense",                  type: "expense",   normal: "debit",  partyRequired: false },
+  "expense.bank_charges":            { parentName: "Bank Charges",                          type: "expense",   normal: "debit",  partyRequired: false },
+  "expense.gateway_fees":            { parentName: "Payment Gateway Charges",               type: "expense",   normal: "debit",  partyRequired: false },
+
+  "tax.gst.input":                   { parentName: "GST Input",                             type: "asset",     normal: "debit",  partyRequired: false },
+  "tax.gst.output":                  { parentName: "GST Output",                            type: "liability", normal: "credit", partyRequired: false },
+  "tax.tds.receivable":              { parentName: "TDS Receivable",                        type: "asset",     normal: "debit",  partyRequired: false },
+};
+
+// Families where posting **must** use a child with party name
+const PARTY_FAMILIES = new Set([
+  "assets.receivables",
+  "liabilities.payables",
+  "liabilities.customer_advances",
+]);
+
+function assertFamilyCodeOrThrow(family_code) {
+  if (!FAMILY_META[family_code]) {
+    const list = Object.keys(FAMILY_META).join(", ");
+    throw new Error(`Unknown family_code '${family_code}'. Allowed: ${list}`);
+  }
+}
+function assertInvariantsOrThrow(family_code, type, normal) {
+  const meta = FAMILY_META[family_code];
+  if (type && String(type) !== meta.type) {
+    throw new Error(`Type mismatch for ${family_code}: expected '${meta.type}', got '${type}'`);
+  }
+  if (normal && String(normal) !== meta.normal) {
+    throw new Error(`Normal-balance mismatch for ${family_code}: expected '${meta.normal}', got '${normal}'`);
+  }
+}
+
+/**
+ * Create or return the canonical parent ledger for a family_code in a tenant.
+ * Adds (session_id, family_code, source='system') and respects invariants.
+ */
+export async function ensureParentForFamily(sessionId, family_code) {
+  assertFamilyCodeOrThrow(family_code);
+  const meta = FAMILY_META[family_code];
+
+  const hasSid = await tableHasColumn("chart_of_accounts", "session_id");
+  const hasFamily = await tableHasColumn("chart_of_accounts", "family_code");
+
+  const scopeSid = hasSid ? (sessionId || "GLOBAL") : null;
+
+  // Prefer existing row with family_code; else fall back by canonical name
+  if (hasFamily) {
+    const rows = await query(
+      hasSid
+        ? `SELECT account_code, name, type, normal_balance, parent_code, family_code
+             FROM chart_of_accounts
+            WHERE session_id = $1 AND family_code = $2
+            LIMIT 1`
+        : `SELECT account_code, name, type, normal_balance, parent_code, family_code
+             FROM chart_of_accounts
+            WHERE family_code = $1
+            LIMIT 1`,
+      hasSid ? [scopeSid, family_code] : [family_code]
+    );
+    if (rows?.rows?.length) return rows.rows[0];
+  }
+
+  const byName = await lookupByNormalizedName(meta.parentName, scopeSid);
+  if (byName?.account_code) {
+    // If the row exists but family_code column exists and is NULL, tag it.
+    if (hasFamily && !byName.family_code) {
+      try {
+        await query(
+          hasSid
+            ? `UPDATE chart_of_accounts SET family_code=$1, source=COALESCE(source,'system')
+                 WHERE session_id=$2 AND account_code=$3`
+            : `UPDATE chart_of_accounts SET family_code=$1, source=COALESCE(source,'system')
+                 WHERE account_code=$2`,
+          hasSid ? [family_code, scopeSid, byName.account_code] : [family_code, byName.account_code]
+        );
+      } catch {}
+    }
+    return { ...byName, family_code };
+  }
+
+  // Create the canonical parent
+  const code = await nextFreeCode();
+  const cols = ["account_code", "name", "type", "normal_balance", "is_active"];
+  const vals = [code, meta.parentName, meta.type, meta.normal, 1];
+
+  if (hasFamily) { cols.push("family_code", "source"); vals.push(family_code, "system"); }
+  if (hasSid)    { cols.push("session_id"); vals.push(scopeSid); }
+
+  const ph = cols.map((_, i) => `$${i + 1}`).join(",");
+
+  try {
+    await query(
+      `INSERT INTO chart_of_accounts (${cols.join(",")}) VALUES (${ph})` +
+        (cols.includes("account_code") ? ` ON CONFLICT (account_code) DO NOTHING` : ""),
+      vals
+    );
+  } catch {
+    await query(
+      `INSERT OR IGNORE INTO chart_of_accounts (${cols.join(",")}) VALUES (${ph})`,
+      vals
+    );
+  }
+
+  const created = await lookupByNormalizedName(meta.parentName, scopeSid);
+  return { ...(created || {}), family_code };
+}
+
+/**
+ * Deterministically create or return a child ledger under the family parent.
+ * Validates invariants and persists family_code/source/rationale.
+ *
+ * @param {string|null} child_display - Suggested child display (e.g., "Acme Pvt Ltd")
+ * @param {string|null} sessionId
+ * @param {object} opts - { family_code, type, normal_balance, source, rationale, allowParentPosting }
+ */
+export async function ensureLedgerExistsWithMapping(child_display, sessionId, opts = {}) {
+  const { family_code, type, normal_balance, source = "llm", rationale = null, allowParentPosting = true } = opts || {};
+  assertFamilyCodeOrThrow(family_code);
+  assertInvariantsOrThrow(family_code, type, normal_balance);
+
+  const meta = FAMILY_META[family_code];
+  const parent = await ensureParentForFamily(sessionId, family_code);
+
+  // Decide final display name
+  const childRaw = normalizeSpaces(normalizeDashes(String(child_display || "")));
+  const mustHaveChild = PARTY_FAMILIES.has(family_code);
+  if (mustHaveChild && !childRaw) {
+    throw new Error(`Child (party) name required for family '${family_code}'.`);
+  }
+
+  // If no child requested and allowed, post to parent directly
+  if (!childRaw && allowParentPosting && !mustHaveChild) {
+    return parent; // parent ledger itself
+  }
+
+  // Compose "Parent - Child" (strip any duplicated prefix)
+  let child = childRaw;
+  if (child.toLowerCase().startsWith(meta.parentName.toLowerCase())) {
+    const sp = child.replace(/^.+?[-:]\s*/, ""); // drop leading "Parent - "
+    if (sp) child = sp;
+  }
+  const fullName = `${meta.parentName} - ${child}`;
+
+  // Lookup existing
+  const existing = await lookupByNormalizedName(fullName, sessionId || null);
+  const hasFamily = await tableHasColumn("chart_of_accounts", "family_code");
+  const hasSid = await tableHasColumn("chart_of_accounts", "session_id");
+
+  if (existing?.account_code) {
+    // Tag with family/source if not already set
+    if (hasFamily && !existing.family_code) {
+      try {
+        if (hasSid) {
+          await query(
+            `UPDATE chart_of_accounts SET family_code=$1, source=COALESCE(source,$2), rationale=COALESCE(rationale,$3)
+               WHERE session_id=$4 AND account_code=$5`,
+            [family_code, source, rationale, sessionId || "GLOBAL", existing.account_code]
+          );
+        } else {
+          await query(
+            `UPDATE chart_of_accounts SET family_code=$1, source=COALESCE(source,$2), rationale=COALESCE(rationale,$3)
+               WHERE account_code=$4`,
+            [family_code, source, rationale, existing.account_code]
+          );
+        }
+      } catch {}
+    }
+    return { ...existing, family_code };
+  }
+
+  // Insert new child under parent
+  const code = await nextFreeCode();
+  const cols = ["account_code", "name", "type", "normal_balance", "is_active", "parent_code"];
+  const vals = [code, fullName, meta.type, meta.normal, 1, parent.account_code];
+  if (hasFamily) { cols.push("family_code", "source"); vals.push(family_code, source); }
+  if (rationale != null && hasFamily) { cols.push("rationale"); vals.push(rationale); }
+  if (hasSid)    { cols.push("session_id"); vals.push(sessionId || "GLOBAL"); }
+
+  const ph = cols.map((_, i) => `$${i + 1}`).join(",");
+
+  try {
+    await query(
+      `INSERT INTO chart_of_accounts (${cols.join(",")}) VALUES (${ph}) ON CONFLICT (account_code) DO NOTHING`,
+      vals
+    );
+  } catch {
+    await query(
+      `INSERT OR IGNORE INTO chart_of_accounts (${cols.join(",")}) VALUES (${ph})`,
+      vals
+    );
+  }
+
+  const created = await lookupByNormalizedName(fullName, sessionId || null);
+  return { ...(created || {}), family_code };
 }
 
 export {

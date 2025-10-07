@@ -1,5 +1,5 @@
 // src/App.jsx
-import React, { useState } from "react";
+import React from "react";
 import { BrowserRouter, Routes, Route, Link, useLocation } from "react-router-dom";
 import { Box, AppBar, Toolbar, Typography, Button } from "@mui/material";
 
@@ -9,6 +9,8 @@ import PromptThreadPane from "./components/PromptThreadPane";
 import ReportsDrawer from "./components/ReportsDrawer";
 import DocumentUpload from "./components/DocumentUpload";
 import BankReconciliation from "./components/BankReconciliation";
+// NEW: brand‑agnostic import/export UI
+import ImportExport from "./components/ImportExport";
 
 function Nav() {
   const { pathname } = useLocation();
@@ -21,6 +23,10 @@ function Nav() {
         <Button color="inherit" component={Link} to="/reports" variant={tab("/reports")}>Reports</Button>
         <Button color="inherit" component={Link} to="/docs" variant={tab("/docs")}>Docs</Button>
         <Button color="inherit" component={Link} to="/bank-reco" variant={tab("/bank-reco")}>Bank Reco</Button>
+        {/* NEW: Import/Export */}
+        <Button color="inherit" component={Link} to="/import-export" variant={tab("/import-export")}>
+          Import/Export
+        </Button>
       </Toolbar>
     </AppBar>
   );
@@ -46,6 +52,8 @@ export default function App() {
             <Route path="/reports" element={<ReportsDrawer sessionId="default-session" />} />
             <Route path="/docs" element={<DocumentUpload sessionId="default-session" />} />
             <Route path="/bank-reco" element={<BankReconciliation />} />
+            {/* NEW: Import/Export route */}
+            <Route path="/import-export" element={<ImportExport />} />
           </Routes>
         </Box>
       </BrowserRouter>
